@@ -80,3 +80,24 @@ quick list
 quick get pricing-demo --json
 quick delete pricing-demo
 ```
+
+## Local verification (no install)
+
+To exercise the tool from a fresh checkout without installing it, run the CLI as a
+module with the tool dirs on `PYTHONPATH`, point the local backend at a writable
+dir, and serve the result with a plain static server (the `*.quick.internal` URL
+the tool returns is the production Cloudflare/IAP domain and is **not**
+DNS-resolvable in dev):
+
+```bash
+export PYTHONPATH=tools/infra:.            # repo root: makes `quick` importable
+export QUICK_LOCAL_ROOT=/tmp/quick-e2e     # writable site root
+
+uv run --with typer --with rich --with httpx --with python-dotenv \
+  python -m quick.cli deploy demo-site ./dist --json
+
+# Browser proof: serve the local root and open http://localhost:8799/demo-site/
+python -m http.server 8799 --directory "$QUICK_LOCAL_ROOT"
+```
+
+Run the unit tests the same way: `PYTHONPATH=tools/infra:. uv run pytest tools/infra/quick/tests`.
