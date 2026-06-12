@@ -20,8 +20,11 @@ the lifecycle controls the Slack card exposes ([Re-generate]/[View Logs]/[Delete
 
 from __future__ import annotations
 
+import json
 import mimetypes
 import re
+import shutil
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -37,6 +40,14 @@ _SITE_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 DEFAULT_BASE_DOMAIN = "quick.internal"
 DEFAULT_LOCAL_ROOT = "/srv/quick-sites"
 DEFAULT_INDEX = "index.html"
+
+# Reserved per-site metadata prefix. The manifest records the deploy owner and
+# file list, powering ownership checks, stale-file cleanup on redeploys, and
+# get/delete on the s3 backend. User files may not be written under it and the
+# serving layer never serves it.
+MANIFEST_DIR = "_quick"
+MANIFEST_PATH = f"{MANIFEST_DIR}/manifest.json"
+DEFAULT_OWNER = "anonymous"
 
 # Guardrails to keep a single deploy bounded.
 MAX_FILES = 500
@@ -122,6 +133,10 @@ def _safe_relpath(raw_path: str) -> str:
         parts.append(part)
     if not parts:
         raise QuickDeployError(f"file path {raw_path!r} did not resolve to a file.")
+    if parts[0] == MANIFEST_DIR:
+        raise QuickDeployError(
+            f"file path {raw_path!r} is reserved: '{MANIFEST_DIR}/' holds Quick metadata."
+        )
     return "/".join(parts)
 
 
@@ -151,6 +166,7 @@ class QuickClient:
         s3_endpoint: str | None = None,
         s3_region: str | None = None,
         public_base_url: str | None = None,
+        owner: str | None = None,
         timeout: float = 30.0,
     ) -> None:
         self.backend = (backend or _cfg("QUICK_DEPLOY_BACKEND", "local")).strip().lower()
@@ -164,6 +180,12 @@ class QuickClient:
         # Optional override when the public URL differs from <id>.<domain>.
         self.public_base_url = (
             (public_base_url or _cfg("QUICK_PUBLIC_BASE_URL", "")).strip().rstrip("/")
+        )
+        # Requester identity (Centaur injects this for the active requester).
+        # Used to stamp manifests and gate redeploy/delete of existing sites.
+        self.owner = (owner or _cfg("QUICK_REQUESTER", DEFAULT_OWNER)).strip() or DEFAULT_OWNER
+        self.enforce_ownership = (
+            _cfg("QUICK_OWNERSHIP_ENFORCE", "true").strip().lower() != "false"
         )
         self.timeout = timeout
         self._http: httpx.Client | None = None
@@ -185,18 +207,25 @@ class QuickClient:
         """
         site_id = _validate_site_id(site_id)
         prepared = self._prepare_files(files)
+        previous = self._read_manifest(site_id)
+        self._check_owner(site_id, previous, action="redeploy")
+        manifest = self._build_manifest(site_id, prepared, previous)
         if self.backend == "local":
-            written = self._deploy_local(site_id, prepared)
+            written = self._deploy_local(site_id, prepared, manifest)
+            removed_stale: list[str] = []  # swap replaces the whole tree
         elif self.backend == "s3":
-            written = self._deploy_s3(site_id, prepared)
+            written = self._deploy_s3(site_id, prepared, manifest)
+            removed_stale = self._cleanup_stale_s3(site_id, previous, prepared)
         else:
             raise QuickDeployError(f"unknown backend {self.backend!r}: use 'local' or 's3'.")
         return {
             "site_id": site_id,
             "url": self._site_url(site_id),
             "backend": self.backend,
+            "owner": manifest["owner"],
             "file_count": len(written),
             "files": [w["path"] for w in written],
+            "removed_stale": removed_stale,
             "bytes": sum(w["bytes"] for w in written),
             "has_index": any(w["path"] == DEFAULT_INDEX for w in written),
             "timestamp": datetime.now(UTC).isoformat(),
@@ -208,12 +237,21 @@ class QuickClient:
             root = self.local_root
             sites = []
             if root.is_dir():
-                for child in sorted(p for p in root.iterdir() if p.is_dir()):
-                    files = [f for f in child.rglob("*") if f.is_file()]
+                for child in sorted(
+                    p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")
+                ):
+                    files = [
+                        f
+                        for f in child.rglob("*")
+                        if f.is_file() and MANIFEST_DIR not in f.relative_to(child).parts
+                    ]
+                    manifest = self._read_manifest(child.name) or {}
                     sites.append(
                         {
                             "site_id": child.name,
                             "url": self._site_url(child.name),
+                            "owner": manifest.get("owner", DEFAULT_OWNER),
+                            "updated_at": manifest.get("updated_at"),
                             "file_count": len(files),
                         }
                     )
@@ -232,9 +270,12 @@ class QuickClient:
             site_dir = self.local_root / site_id
             if not site_dir.is_dir():
                 raise QuickDeployError(f"site {site_id!r} not found.")
+            manifest = self._read_manifest(site_id) or {}
             files = []
             for f in sorted(p for p in site_dir.rglob("*") if p.is_file()):
                 rel = f.relative_to(site_dir).as_posix()
+                if rel.split("/", 1)[0] == MANIFEST_DIR:
+                    continue
                 files.append(
                     {
                         "path": rel,
@@ -246,66 +287,231 @@ class QuickClient:
                 "site_id": site_id,
                 "url": self._site_url(site_id),
                 "backend": self.backend,
+                "owner": manifest.get("owner", DEFAULT_OWNER),
+                "updated_at": manifest.get("updated_at"),
                 "file_count": len(files),
                 "files": files,
             }
-        raise QuickDeployError("get_site is only implemented for the 'local' backend.")
+        manifest = self._read_manifest(site_id)
+        if manifest is None:
+            raise QuickDeployError(f"site {site_id!r} not found (no manifest in bucket).")
+        return {
+            "site_id": site_id,
+            "url": self._site_url(site_id),
+            "backend": self.backend,
+            "owner": manifest.get("owner", DEFAULT_OWNER),
+            "updated_at": manifest.get("updated_at"),
+            "file_count": len(manifest.get("files", [])),
+            "files": manifest.get("files", []),
+        }
 
     def delete_site(self, site_id: str) -> dict[str, Any]:
         """Delete a deployed site and all of its files."""
         site_id = _validate_site_id(site_id)
+        manifest = self._read_manifest(site_id)
+        self._check_owner(site_id, manifest, action="delete")
         if self.backend == "local":
             site_dir = self.local_root / site_id
             if not site_dir.is_dir():
                 raise QuickDeployError(f"site {site_id!r} not found.")
-            removed = sum(1 for p in site_dir.rglob("*") if p.is_file())
-            import shutil
-
+            removed = sum(
+                1
+                for p in site_dir.rglob("*")
+                if p.is_file() and MANIFEST_DIR not in p.relative_to(site_dir).parts
+            )
             shutil.rmtree(site_dir)
             return {"site_id": site_id, "backend": self.backend, "deleted_files": removed}
-        raise QuickDeployError("delete_site is only implemented for the 'local' backend.")
+        if manifest is None:
+            raise QuickDeployError(f"site {site_id!r} not found (no manifest in bucket).")
+        deleted = 0
+        for f in manifest.get("files", []):
+            if f.get("path"):
+                self._delete_s3_object(f"{site_id}/{f['path']}")
+                deleted += 1
+        # Manifest goes last so an interrupted delete is retryable.
+        self._delete_s3_object(f"{site_id}/{MANIFEST_PATH}")
+        return {"site_id": site_id, "backend": self.backend, "deleted_files": deleted}
 
     # -- backends -------------------------------------------------------------
 
-    def _deploy_local(self, site_id: str, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        site_root = (self.local_root / site_id).resolve()
+    def _deploy_local(
+        self, site_id: str, files: list[dict[str, Any]], manifest: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Atomically deploy by building a staging tree, then swapping it live.
+
+        Readers (the static server) only ever see the old complete tree or the
+        new complete tree — never a half-written mix. Stale files from the
+        previous deploy disappear with the swap by construction.
+        """
         base = self.local_root.resolve()
-        site_root.mkdir(parents=True, exist_ok=True)
+        staging_parent = base / ".staging"
+        staging = staging_parent / f"{site_id}.{uuid.uuid4().hex[:12]}"
+        trash = staging_parent / f"{site_id}.trash.{uuid.uuid4().hex[:12]}"
+        staging.mkdir(parents=True, exist_ok=False)
         written = []
-        for f in files:
-            target = (site_root / f["path"]).resolve()
-            if base not in target.parents and target != base:
-                raise QuickDeployError(f"refusing to write outside site root: {f['path']!r}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(f["data"])
-            written.append({"path": f["path"], "bytes": len(f["data"])})
+        try:
+            for f in files:
+                target = (staging / f["path"]).resolve()
+                if staging.resolve() not in target.parents:
+                    raise QuickDeployError(
+                        f"refusing to write outside site root: {f['path']!r}"
+                    )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(f["data"])
+                written.append({"path": f["path"], "bytes": len(f["data"])})
+            manifest_file = staging / MANIFEST_PATH
+            manifest_file.parent.mkdir(parents=True, exist_ok=True)
+            manifest_file.write_text(json.dumps(manifest, indent=2))
+            # Swap: live -> trash, staging -> live. Each rename is atomic.
+            live = base / site_id
+            if live.exists():
+                live.rename(trash)
+            try:
+                staging.rename(live)
+            except OSError:
+                if trash.exists():  # restore previous version on failure
+                    trash.rename(live)
+                raise
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(trash, ignore_errors=True)
         return written
 
-    def _deploy_s3(self, site_id: str, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _deploy_s3(
+        self, site_id: str, files: list[dict[str, Any]], manifest: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         if not self.s3_bucket:
             raise QuickDeployError("QUICK_S3_BUCKET is not set; required for the s3 backend.")
         written = []
         for f in files:
-            key = f"{site_id}/{f['path']}"
-            url = self._s3_object_url(key)
-            try:
-                resp = self.client.put(
-                    url,
-                    content=f["data"],
-                    headers={"Content-Type": f["content_type"]},
-                )
-                resp.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                raise QuickDeployError(
-                    f"s3 upload failed for {key!r}: {exc.response.status_code} "
-                    f"{exc.response.text[:200]}"
-                ) from exc
-            except httpx.RequestError as exc:
-                raise QuickDeployError(f"s3 upload request failed for {key!r}: {exc}") from exc
+            self._put_s3_object(f"{site_id}/{f['path']}", f["data"], f["content_type"])
             written.append({"path": f["path"], "bytes": len(f["data"])})
+        # The manifest is written last: if any file upload failed above we never
+        # get here, so an incomplete deploy is never recorded as the current one.
+        self._put_s3_object(
+            f"{site_id}/{MANIFEST_PATH}",
+            json.dumps(manifest, indent=2).encode("utf-8"),
+            "application/json; charset=utf-8",
+        )
         return written
 
     # -- helpers (excluded from tool registration) ----------------------------
+
+    def _build_manifest(
+        self,
+        site_id: str,
+        prepared: list[dict[str, Any]],
+        previous: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        return {
+            "site_id": site_id,
+            "owner": (previous or {}).get("owner", self.owner),
+            "created_at": (previous or {}).get("created_at", now),
+            "updated_at": now,
+            "deploy_count": int((previous or {}).get("deploy_count", 0)) + 1,
+            "backend": self.backend,
+            "files": [
+                {"path": f["path"], "bytes": len(f["data"]), "content_type": f["content_type"]}
+                for f in prepared
+            ],
+        }
+
+    def _check_owner(
+        self, site_id: str, manifest: dict[str, Any] | None, *, action: str
+    ) -> None:
+        """Reject mutating an existing site owned by someone else."""
+        if manifest is None or not self.enforce_ownership:
+            return
+        owner = manifest.get("owner") or DEFAULT_OWNER
+        if owner != self.owner:
+            raise QuickDeployError(
+                f"site {site_id!r} is owned by {owner!r}; {action} as {self.owner!r} denied. "
+                "Pick a different site_id, or set QUICK_OWNERSHIP_ENFORCE=false to override."
+            )
+
+    def _read_manifest(self, site_id: str) -> dict[str, Any] | None:
+        """Return the current manifest for a site, or None if never deployed."""
+        if self.backend == "local":
+            path = self.local_root / site_id / MANIFEST_PATH
+            if not path.is_file():
+                return None
+            try:
+                return json.loads(path.read_text())
+            except (OSError, ValueError):
+                return None
+        data = self._get_s3_object(f"{site_id}/{MANIFEST_PATH}", missing_ok=True)
+        if data is None:
+            return None
+        try:
+            return json.loads(data)
+        except ValueError:
+            return None
+
+    def _cleanup_stale_s3(
+        self,
+        site_id: str,
+        previous: dict[str, Any] | None,
+        prepared: list[dict[str, Any]],
+    ) -> list[str]:
+        """Delete files present in the previous deploy but absent from this one.
+
+        Runs after the new manifest is written, so a cleanup failure leaves only
+        harmless extra objects behind — never a broken current deploy.
+        """
+        if not previous:
+            return []
+        old_paths = {f.get("path") for f in previous.get("files", []) if f.get("path")}
+        new_paths = {f["path"] for f in prepared}
+        removed = []
+        for stale in sorted(old_paths - new_paths):
+            try:
+                self._delete_s3_object(f"{site_id}/{stale}")
+                removed.append(stale)
+            except QuickDeployError:
+                continue  # best-effort; stale objects are inert
+        return removed
+
+    def _put_s3_object(self, key: str, data: bytes, content_type: str) -> None:
+        url = self._s3_object_url(key)
+        try:
+            resp = self.client.put(url, content=data, headers={"Content-Type": content_type})
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise QuickDeployError(
+                f"s3 upload failed for {key!r}: {exc.response.status_code} "
+                f"{exc.response.text[:200]}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise QuickDeployError(f"s3 upload request failed for {key!r}: {exc}") from exc
+
+    def _get_s3_object(self, key: str, *, missing_ok: bool = False) -> bytes | None:
+        url = self._s3_object_url(key)
+        try:
+            resp = self.client.get(url)
+            if resp.status_code == 404 and missing_ok:
+                return None
+            resp.raise_for_status()
+            return resp.content
+        except httpx.HTTPStatusError as exc:
+            raise QuickDeployError(
+                f"s3 fetch failed for {key!r}: {exc.response.status_code}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise QuickDeployError(f"s3 fetch request failed for {key!r}: {exc}") from exc
+
+    def _delete_s3_object(self, key: str) -> None:
+        url = self._s3_object_url(key)
+        try:
+            resp = self.client.delete(url)
+            if resp.status_code not in (200, 204, 404):
+                resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise QuickDeployError(
+                f"s3 delete failed for {key!r}: {exc.response.status_code}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise QuickDeployError(f"s3 delete request failed for {key!r}: {exc}") from exc
 
     @property
     def client(self) -> httpx.Client:

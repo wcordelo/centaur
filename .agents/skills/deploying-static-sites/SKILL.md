@@ -101,3 +101,20 @@ python -m http.server 8799 --directory "$QUICK_LOCAL_ROOT"
 ```
 
 Run the unit tests the same way: `PYTHONPATH=tools/infra:. uv run pytest tools/infra/quick/tests`.
+
+## Ownership, atomic deploys, and serving (v2)
+
+- Each site records an **owner** (`QUICK_REQUESTER`) in `_quick/manifest.json`
+  on first deploy. Redeploying or deleting a site owned by someone else fails —
+  pick a different `site_id`. The `_quick/` prefix is reserved; never write to it.
+- Deploys are **atomic on the local backend** (stage-and-swap) and ordered on
+  s3 (all files first, manifest last, stale files cleaned up after). A failed
+  deploy never leaves a half-updated live site, and files removed from a new
+  version no longer linger.
+- `get_site` / `delete_site` now work on the **s3 backend** too, driven by the
+  manifest. `deploy_artifact` responses include `owner` and `removed_stale`.
+- To serve local-backend sites end to end, run `python -m quick.server`
+  (wildcard `Host` routing for `<site>.quick.internal`, plus a
+  `/sites/<site_id>/` path fallback for plain-localhost testing). It never
+  serves `_quick/` or dotfiles. Authentication stays at the IAP layer in front,
+  per references/architecture.md.
