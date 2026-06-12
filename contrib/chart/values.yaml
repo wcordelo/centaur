@@ -284,3 +284,32 @@ containerSecurityContext:
   capabilities:
     drop:
       - ALL
+
+# Quick — wildcard static serving for agent-deployed artifacts (off by default).
+# Pair with the `quick` tool: agents deploy via deploy_artifact; this module
+# serves the result at https://<site_id>.<baseDomain>. Auth is enforced by the
+# proxy in front (Google IAP via quick.iap on GKE, or a Cloudflare Access app
+# covering *.<baseDomain>) — never by quick-server itself.
+quick:
+  enabled: false
+  replicaCount: 1
+  # Defaults to the API image (which contains tools/infra/quick); override to
+  # pin a dedicated image.
+  image: ""
+  baseDomain: quick.internal
+  localRoot: /srv/quick-sites
+  service:
+    port: 8943
+  persistence:
+    # RWX so agent sandboxes (writers) and quick-server (reader) share the tree.
+    size: 10Gi
+    storageClassName: ""
+  ingress:
+    className: ""
+    annotations: {}
+    # Wildcard cert secret for *.<baseDomain> (e.g. from cert-manager).
+    tlsSecretName: ""
+  iap:
+    enabled: false
+    # K8s secret holding the IAP OAuth client credentials (GKE BackendConfig).
+    oauthSecretName: quick-iap-oauth

@@ -12,6 +12,8 @@ const EnvSchema = z.object({
   // so they continue to open in the browser. Set this to the workspace where the
   // bot lives so replies open directly in the Slack desktop/mobile app.
   SLACK_TEAM_ID: z.string().optional(),
+  /** Base domain for Quick static sites; enables the deploy card buttons. */
+  QUICK_BASE_DOMAIN: z.string().default('quick.internal'),
   SLACKBOT_API_KEY: z.string().optional(),
   CENTAUR_API_URL: z.string().url().default('http://localhost:8000'),
   CENTAUR_API_KEY: z.string().optional(),

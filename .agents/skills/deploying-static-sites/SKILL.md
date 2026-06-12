@@ -118,3 +118,16 @@ Run the unit tests the same way: `PYTHONPATH=tools/infra:. uv run pytest tools/i
   `/sites/<site_id>/` path fallback for plain-localhost testing). It never
   serves `_quick/` or dotfiles. Authentication stays at the IAP layer in front,
   per references/architecture.md.
+
+## End-to-end platform (v2)
+
+- **Slack card**: final agent replies containing a Quick URL are decorated with
+  [Re-generate] [View files] [Delete site] buttons. Clicks become normal agent
+  turns in the thread attributed to the *clicking* user, so Quick's ownership
+  check applies to them — not the bot.
+- **Serving in-cluster**: enable `quick.enabled` in the chart to deploy
+  quick-server with an RWX volume shared with sandboxes, plus a wildcard
+  ingress for `*.<quick.baseDomain>`.
+- **Auth**: set `quick.iap.enabled` (Google IAP on GKE) or front the wildcard
+  host with a Cloudflare Access application. quick-server itself is
+  intentionally auth-agnostic.

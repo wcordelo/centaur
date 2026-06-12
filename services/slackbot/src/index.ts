@@ -5,6 +5,12 @@ import { timeout } from 'hono/timeout'
 import { requestId } from 'hono/request-id'
 import { prettyJSON } from 'hono/pretty-json'
 import { startFinalDeliveryPoller } from './centaur/final-delivery'
+import {
+  parseQuickBlockAction,
+  quickActionAckBody,
+  synthesizeQuickActionEnvelope,
+  type QuickBlockAction
+} from './slack/quick-actions'
 import { CentaurHandoff } from './centaur/handoff'
 import { loadConfig } from './config'
 import { logError, logInfo, logWarn, sanitizeLogValue } from './logging'
@@ -140,6 +146,13 @@ const slackHandler = async (c: Context<{ Variables: Variables }>) => {
   const envelope = parseSlackBody(c.get('slackRawBody'), c.req.header('content-type'))
   if (!envelope) return c.json({ ok: false, error: 'invalid_slack_payload' }, 400)
   if (envelope.type === 'url_verification') return c.json({ challenge: envelope.challenge })
+
+  if ((envelope as any).type === 'block_actions') {
+    const quickAction = parseQuickBlockAction(envelope)
+    if (!quickAction) return c.json({ ok: true, ignored: 'unhandled_block_action' })
+    runInBackground(c, handleQuickBlockAction(quickAction, (envelope as any).trigger_id ?? `${Date.now()}`))
+    return c.json({ ok: true })
+  }
 
   const event = envelope.event
   const key = slackDedupKey({
@@ -521,6 +534,26 @@ function codexThreadIdFromUnknown(value: unknown): string | undefined {
     if (found) return found
   }
   return undefined
+}
+
+/**
+ * Handle a Quick deploy-card button click: ack ephemerally via response_url,
+ * then replay the click as a normal in-thread agent turn attributed to the
+ * clicking user (so Quick's ownership check sees them as the requester).
+ */
+async function handleQuickBlockAction(action: QuickBlockAction, triggerId: string): Promise<void> {
+  if (action.responseUrl) {
+    try {
+      await fetch(action.responseUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(quickActionAckBody(action))
+      })
+    } catch {
+      // The ack is cosmetic; the turn below is what matters.
+    }
+  }
+  await processSlackEvent(synthesizeQuickActionEnvelope(action, triggerId) as SlackEnvelope)
 }
 
 async function processSlackEvent(envelope: SlackEnvelope): Promise<void> {

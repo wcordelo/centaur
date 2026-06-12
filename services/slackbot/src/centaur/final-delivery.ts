@@ -2,6 +2,7 @@ import type { WebClient } from "@slack/web-api";
 import { centaurApiKey, type AppConfig } from "../config";
 import { slackReplyLimits } from "../constants";
 import { logError } from "../logging";
+import { buildQuickDeployCards } from "../slack/quick-card";
 import {
   activeSpanAttributes,
   clientSpanOptions,
@@ -148,6 +149,7 @@ async function deliver(
     threadTs,
     executionId(delivery),
     config.SLACK_TEAM_ID,
+    config.QUICK_BASE_DOMAIN,
     chunks,
   );
 }
@@ -162,6 +164,7 @@ async function postFollowups(
   threadTs: string,
   executionId: string,
   teamId: string | undefined,
+  quickBaseDomain: string,
   chunks: string[],
 ): Promise<void> {
   const posted = await withSpan(
@@ -176,6 +179,12 @@ async function postFollowups(
   for (const [index, chunk] of chunks.entries()) {
     if (posted.has(index)) continue;
     const renderedChunk = rewriteSlackArchiveLinksForApp(chunk, teamId);
+    // Decorate the final chunk with interactive Quick deploy cards when the
+    // agent's answer contains a Quick site URL.
+    const quickCards =
+      index === chunks.length - 1
+        ? buildQuickDeployCards(renderedChunk, quickBaseDomain)
+        : [];
     const response = await withSpan(
       "centaur.slackbot.slack.post_message",
       clientSpanOptions({
@@ -191,7 +200,7 @@ async function postFollowups(
           channel,
           thread_ts: threadTs,
           text: renderedChunk,
-          blocks: renderMarkdownBlocks(renderedChunk),
+          blocks: [...renderMarkdownBlocks(renderedChunk), ...(quickCards as any[])],
           unfurl_links: false,
           unfurl_media: false,
           metadata: chunkMetadata(executionId, index, chunks.length),
