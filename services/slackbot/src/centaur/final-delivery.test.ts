@@ -8,6 +8,7 @@ const config: AppConfig = {
   CENTAUR_API_URL: "http://centaur-api.test",
   CENTAUR_API_KEY: "centaur-test-key",
   CENTAUR_SLACK_EVENTS_PATH: "/api/webhooks/slack",
+  QUICK_BASE_DOMAIN: "quick.internal",
   RUNTIME_ERROR_ALERT_CHANNEL: "",
   SLACK_EVENT_DEDUP_TTL_MS: 600000,
   SLACK_SIGNATURE_MAX_AGE_SECONDS: 300,

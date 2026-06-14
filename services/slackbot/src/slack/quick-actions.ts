@@ -46,7 +46,10 @@ export function parseQuickBlockAction(envelope: any): QuickBlockAction | null {
 
   let ref: QuickSiteRef
   try {
-    const parsed = JSON.parse(typeof action?.value === 'string' ? action.value : '')
+    const parsed = JSON.parse(typeof action?.value === 'string' ? action.value : '') as {
+      siteId?: unknown
+      url?: unknown
+    }
     if (typeof parsed?.siteId !== 'string' || typeof parsed?.url !== 'string') return null
     ref = { siteId: parsed.siteId, url: parsed.url }
   } catch {
