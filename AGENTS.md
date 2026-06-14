@@ -65,6 +65,10 @@ kubectl exec -n centaur deploy/centaur-centaur-api -- curl -s "http://localhost:
 
 Or create a DB-backed key for external use (see [API Key Management](#api-key-management)).
 
+### Local Slack on kind / laptop clusters
+
+For `@bot` mentions through a Cloudflare (or other) tunnel, see [docs/public/md/local-slack-dev.md](docs/public/md/local-slack-dev.md). Use `contrib/chart/values.local-slack.example.yaml` with `CENTAUR_EXTRA_VALUES`.
+
 ## Architecture
 
 See the [architecture diagram in the README](README.md#architecture).

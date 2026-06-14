@@ -1,0 +1,45 @@
+# Paste into api.slack.com/apps → your app → App Manifest (YAML tab).
+# Replace request_url with your tunnel URL, then Save → reinstall the app.
+# Copy the new Bot User OAuth Token into .env as SLACK_BOT_TOKEN.
+
+display_information:
+  name: Centaur Dev
+features:
+  bot_user:
+    display_name: centaur-dev
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      # Required for @bot mentions
+      - app_mentions:read
+      - chat:write
+      # Required for thread context (fixes missing_scope on conversations.replies)
+      - channels:history
+      - channels:read
+      # Optional: private channels, DMs, group DMs
+      - groups:history
+      - groups:read
+      - im:history
+      - im:read
+      - mpim:history
+      - mpim:read
+      # Optional: user names in messages; 👌 ack reaction; file uploads
+      - users:read
+      - reactions:write
+      - files:write
+settings:
+  event_subscriptions:
+    request_url: https://YOUR-TUNNEL-HOST/api/webhooks/slack
+    bot_events:
+      - app_mention
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+  interactivity:
+    is_enabled: true
+    request_url: https://YOUR-TUNNEL-HOST/api/webhooks/slack
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
