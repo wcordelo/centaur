@@ -42,17 +42,19 @@ ironControl:
 #   kind load docker-image centaur-agent:latest --name centaur
 #
 # LLM backend (pick one):
-#   A) Local Gemma via vLLM on the host (default below) — no cloud API key.
-#   B) OpenAI — comment out sandbox.extraEnv vLLM keys and set OPENAI_API_KEY in .env.
+#   A) OpenAI (default below) — set OPENAI_API_KEY in .env, run sync-local-env.sh.
+#   B) Local Gemma via vLLM — uncomment extraEnv block; start vLLM on :8000.
+#      Gemma 4 E2B emits Codex <|channel> control tokens; Slack replies are broken
+#      until we add stripping or use a non-E2B checkpoint. Dev-only egress hole.
 sandbox:
   harnessEngine: codex
-  extraEnv:
-    CODEX_USE_VLLM: "1"
-    VLLM_API_KEY: local
-    VLLM_BASE_URL: http://host.docker.internal:8000/v1
-    # Must match vLLM --served-model-name (not necessarily the HuggingFace id).
-    CODEX_MODEL: gemma
-    NO_PROXY: host.docker.internal,host.orb.internal
+  extraEnv: {}
+  # extraEnv:
+  #   CODEX_USE_VLLM: "1"
+  #   VLLM_API_KEY: local
+  #   VLLM_BASE_URL: http://host.docker.internal:8000/v1
+  #   CODEX_MODEL: gemma
+  #   NO_PROXY: host.docker.internal,host.orb.internal
 
 ironProxy:
   secretSource: env

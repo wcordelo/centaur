@@ -66,6 +66,11 @@ pub struct AgentSandboxConfig {
     /// destinations except the proxy/control plane, so without this rule the
     /// harness's usage/cost spans never leave the pod.
     pub otlp_egress: Option<OtlpEgressTarget>,
+    /// Host-reachable TCP ports (e.g. local vLLM on :8000) that bypass
+    /// iron-proxy via NO_PROXY but still need an egress NetworkPolicy hole.
+    /// Only populated when api-rs validates CODEX_USE_VLLM=1 and an
+    /// allowlisted VLLM_BASE_URL host (local dev gateways / loopback).
+    pub host_egress_ports: Vec<u16>,
     pub ready_timeout: Duration,
 }
 
@@ -107,6 +112,7 @@ impl AgentSandboxConfig {
             iron_control: None,
             tools: None,
             otlp_egress: None,
+            host_egress_ports: Vec::new(),
             ready_timeout: Duration::from_secs(60),
         }
     }

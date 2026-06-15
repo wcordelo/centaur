@@ -44,7 +44,7 @@ Required variables:
 | `SLACK_BOT_TOKEN` | Slack app Bot User OAuth Token (`xoxb-...`) |
 | `SLACK_SIGNING_SECRET` | Slack app signing secret |
 | `SLACKBOT_API_KEY` | Centaur-internal key (not from Slack); must match API config |
-| `OPENAI_API_KEY` | Only if **not** using local vLLM (see below); synced by `sync-local-env.sh` |
+| `OPENAI_API_KEY` | **Default** for the example overlay (Codex → OpenAI via iron-proxy); synced by `sync-local-env.sh` |
 | `ANTHROPIC_API_KEY` | Only if you set `sandbox.harnessEngine: claudecode` instead of the local overlay default |
 | `OP_SERVICE_ACCOUNT_TOKEN` | Placeholder OK for env mode (e.g. `local-placeholder`) |
 | `OP_VAULT` | Placeholder OK for env mode |
@@ -135,9 +135,28 @@ contrib/scripts/sync-local-env.sh
 
 This patches `centaur-infra-env` and restarts api-rs, slackbotv2, and any other deployed dependents.
 
-## Local LLM with vLLM (Gemma)
+## LLM backend (default: OpenAI)
 
-The example overlay (`values.local-slack.example.yaml`) points Codex at a **[vLLM](https://vllm.ai/)** server on your Mac instead of OpenAI. Sandboxes use Codex’s [vLLM provider](https://docs.vllm.ai/en/stable/serving/integrations/codex/) (`wire_api = "responses"`), so no cloud API key is required.
+The example overlay uses **Codex + OpenAI** (`harness/codex/config.toml`, model `gpt-5.5`). Set `OPENAI_API_KEY` in `.env`, run `sync-local-env.sh`, and deploy. No extra `sandbox.extraEnv` is required.
+
+After changing the overlay or api-rs image, **start a new Slack thread** or delete stale sandbox pods — each thread keeps its sandbox, and old pods retain the previous harness/env until recycled:
+
+```bash
+kubectl get pods -n centaur | grep asbx
+kubectl delete pod -n centaur asbx-<id>-1 asbx-<id>-1-proxy-<id>   # per stale sandbox
+```
+
+Tail **slackbot v2** logs (not v1):
+
+```bash
+kubectl logs -n centaur deploy/centaur-centaur-slackbotv2 -f
+```
+
+## Optional: local LLM with vLLM (experimental)
+
+> **Status:** Gemma 4 **E2B** checkpoints emit Codex `<|channel>` control tokens through vLLM; Slack replies are garbled (bullets, token soup) until we add response stripping or use a non-E2B model. Use **OpenAI** for reliable local Slack dev.
+
+To try vLLM anyway, uncomment the `sandbox.extraEnv` block in `values.local-slack.example.yaml` and start a vLLM server on your Mac. Sandboxes use Codex’s [vLLM provider](https://docs.vllm.ai/en/stable/serving/integrations/codex/) (`wire_api = "responses"`).
 
 ### 1. Start vLLM on the host (Apple Silicon)
 
@@ -186,6 +205,10 @@ The image includes `harness/codex/config.vllm.toml`; entrypoint activates it whe
 
 Sandboxes call `http://host.docker.internal:8000/v1` (OrbStack: try `host.orb.internal` and update `VLLM_BASE_URL` in the overlay). The overlay adds those hosts to `NO_PROXY` so iron-proxy does not intercept plain HTTP to your Mac.
 
+Per-sandbox **NetworkPolicy** normally blocks all egress except iron-proxy and api-rs. When `CODEX_USE_VLLM=1` and `VLLM_BASE_URL` points at an **allowlisted** host (`host.docker.internal`, `host.orb.internal`, `localhost`, `127.0.0.1`), api-rs adds a dev-only egress rule for that port (default TCP/8000). The rule is **port-scoped but not destination-scoped** — sandboxes can reach any IP on that port, not only your Mac. That is intentional for kind host-gateway dev but **must never be enabled in production** (do not deploy this overlay outside local clusters).
+
+If `VLLM_BASE_URL` uses any other host, api-rs **refuses** to open the egress hole and logs a warning; vLLM will be unreachable from sandboxes until you fix the URL.
+
 From a test pod:
 
 ```bash
@@ -200,9 +223,9 @@ export CENTAUR_EXTRA_VALUES=contrib/chart/values.local-slack.example.yaml
 just up
 ```
 
-Start a **new Slack thread** after redeploy (old sandboxes may still use the previous harness/config).
+Start a **new Slack thread** after enabling vLLM (old sandboxes keep the previous OpenAI config).
 
-To use **OpenAI** instead, remove or comment out the `sandbox.extraEnv` vLLM block in the overlay and set `OPENAI_API_KEY` in `.env`, then run `contrib/scripts/sync-local-env.sh`.
+To return to **OpenAI**, set `sandbox.extraEnv: {}` in the overlay, set `OPENAI_API_KEY` in `.env`, run `sync-local-env.sh`, restart api-rs, and delete stale `asbx-*` pods.
 
 ## Slack tunnel
 
@@ -262,6 +285,9 @@ kubectl logs -n centaur deploy/centaur-centaur-slackbotv2 --tail=20
 | `401` / LLM auth in sandbox logs | Per-sandbox iron-proxy missing real key | `contrib/scripts/sync-local-env.sh`; start a new session (new sandbox) |
 | cloudflared EOF / connection refused | Port-forward dead | Restart `dev-slack-tunnel.sh` |
 | Empty bot replies | LLM auth failure in sandbox | Fix secrets; `@bot` again (new sandbox) |
+| Garbled replies (`<|channel>`, `●`, backticks) | vLLM + Gemma E2B incompatible with Codex Slack path | Use OpenAI default overlay; or fix vLLM model/checkpoint |
+| Good logs, bad reply in old thread | Stale sandbox reused | New thread or delete `asbx-*` pods for that thread |
+| Debugging wrong component | Tailing v1 slackbot | `kubectl logs deploy/centaur-centaur-slackbotv2` |
 | `slack_thread_history_collect_failed` / `missing_scope` | Bot token missing history scopes | Add scopes above; reinstall app; refresh `SLACK_BOT_TOKEN` and `sync-local-env.sh` |
 | `ImagePullBackOff` on api-rs / slackbotv2 | Images not built | `just build-one api-rs` and `just build-one slackbotv2` |
 | `final_delivery_poll_failed` (v1 only) | Python API not deployed | Use v2 overlay or enable `api.enabled=true` for v1 |
@@ -297,6 +323,25 @@ contrib/scripts/dev-slack-health.sh
 When a 1Password service account can read your LLM vault, use `ironProxy.secretSource=onepassword` and `contrib/scripts/setup-ironproxy-onepassword.sh`.
 
 Some personal 1Password accounts cannot grant service accounts access to Private or Communal vaults. In that case use **env mode** (`OPENAI_API_KEY` in `centaur-infra-env`) as shown in the example values file.
+
+## Operational notes (local dev)
+
+Summary of what the local Slack stack expects — useful when picking this up again:
+
+| Layer | What to know |
+|-------|----------------|
+| **Overlay** | `contrib/chart/values.local-slack.example.yaml` — slackbotv2 + api-rs, v1 slackbot/api disabled, iron-control on arm64 |
+| **Secrets** | `.env` → `contrib/scripts/sync-local-env.sh` → `centaur-infra-env` (includes `OPENAI_API_KEY`, Slack tokens, `SLACKBOT_API_KEY`) |
+| **LLM** | Default OpenAI via iron-proxy; optional vLLM needs `CODEX_USE_VLLM=1` + allowlisted `VLLM_BASE_URL` |
+| **NetworkPolicy** | api-rs opens a **dev-only** egress hole on the vLLM TCP port when vLLM env is validated (`host.docker.internal`, etc. only); port-scoped, not host-scoped — never enable in prod |
+| **Sandboxes** | One `asbx-*` pod per Slack thread; config is fixed at create time — recycle pods after overlay/api-rs/agent image changes |
+| **Tunnel** | `contrib/scripts/dev-slack-tunnel.sh` → Cloudflare URL → Slack Event Subscriptions Request URL `/api/webhooks/slack` |
+| **Health** | `contrib/scripts/dev-slack-health.sh`; api-rs `:8080/health`, slackbotv2 `:3001/health` |
+
+Code touched for vLLM host egress (when experimenting locally):
+
+- `services/api-rs/crates/centaur-api-server/src/args.rs` — derives `host_egress_ports` from `SESSION_SANDBOX_EXTRA_ENV`
+- `services/api-rs/crates/centaur-sandbox-agent-k8s/` — `AgentSandboxConfig.host_egress_ports`, NetworkPolicy in `iron_proxy.rs`
 
 ## Related
 
