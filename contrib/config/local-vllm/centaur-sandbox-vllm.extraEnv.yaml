@@ -1,0 +1,21 @@
+# Drop-in sandbox.extraEnv for local Gemma 4 via vLLM (Codex harness).
+# Merge into your Helm values or copy into contrib/chart/values.local-slack.example.yaml.
+#
+# Prerequisites:
+#   - vLLM listening on host :8000 (contrib/scripts/start-local-vllm-gemma4.sh)
+#   - Agent image built with CENTAUR_SANDBOX_HARNESS=codex
+#   - sandbox.harnessEngine: codex
+#
+# WARNING: Dev-only. Opens a port-scoped NetworkPolicy egress hole in api-rs.
+# Never deploy CODEX_USE_VLLM=1 outside local kind/k3s clusters.
+
+sandbox:
+  harnessEngine: codex
+  extraEnv:
+    CODEX_USE_VLLM: "1"
+    VLLM_API_KEY: local
+    VLLM_BASE_URL: http://host.docker.internal:8000/v1
+    CODEX_MODEL: gemma
+    NO_PROXY: host.docker.internal,host.orb.internal
+
+# OrbStack users: set VLLM_BASE_URL to http://host.orb.internal:8000/v1

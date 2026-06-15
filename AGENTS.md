@@ -67,7 +67,7 @@ Or create a DB-backed key for external use (see [API Key Management](#api-key-ma
 
 ### Local Slack on kind / laptop clusters
 
-For `@bot` mentions through a Cloudflare (or other) tunnel, see [docs/public/md/local-slack-dev.md](docs/public/md/local-slack-dev.md). Use `contrib/chart/values.local-slack.example.yaml` with `CENTAUR_EXTRA_VALUES` (slackbot v2 + api-rs; default LLM is OpenAI via `OPENAI_API_KEY` in `.env`). Optional local vLLM requires `CODEX_USE_VLLM=1` in overlay `sandbox.extraEnv` and api-rs host-egress NetworkPolicy support — see the doc’s operational notes.
+For `@bot` mentions through a Cloudflare (or other) tunnel, see [docs/public/md/local-slack-dev.md](docs/public/md/local-slack-dev.md). Use `contrib/chart/values.local-slack.example.yaml` with `CENTAUR_EXTRA_VALUES` (slackbot v2 + api-rs; default LLM is OpenAI via `OPENAI_API_KEY` in `.env`). Optional local vLLM requires `CODEX_USE_VLLM=1` in overlay `sandbox.extraEnv` and api-rs host-egress NetworkPolicy support — see [docs/local-model-development.md](docs/local-model-development.md) and the Slack doc’s operational notes.
 
 ## Architecture
 
