@@ -3,7 +3,9 @@ import { randomUUID } from 'node:crypto'
 import { Hono, type Context } from 'hono'
 import {
   Chat,
+  Message,
   StreamingPlan,
+  type ActionEvent,
   type Adapter,
   type Logger,
   type Message as ChatMessage,
@@ -30,6 +32,8 @@ import {
   sessionStreamError
 } from './session-api'
 import { extractMessageOverrides } from './overrides'
+import { buildQuickDeployCard, quickActionId } from './quick-card'
+import { parseQuickAction, quickActionPrompt } from './quick-actions'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
 import type {
   ForwardSessionInput,
@@ -133,6 +137,13 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     })
   })
 
+  chat.onAction(
+    [quickActionId('redeploy'), quickActionId('files'), quickActionId('delete')],
+    async event => {
+      await handleQuickAction(event, { options, state })
+    }
+  )
+
   const app = new Hono()
   app.get('/health', c => c.json({ ok: true, service: 'slackbotv2' }))
   const handleSlackWebhook = async (c: Context) => {
@@ -231,6 +242,48 @@ async function ensureStateConnected(state: StateAdapter, options: SlackbotV2Opti
       await sleep(delayMs)
     }
   }
+}
+
+/**
+ * Handles a Quick deploy-card button click. The click is converted into a
+ * synthetic in-thread message authored by the clicking user, then driven
+ * through the normal execute pipeline so the agent re-generates / inspects /
+ * deletes the site — and the Quick tool's ownership check sees the clicking
+ * user as the requester.
+ */
+async function handleQuickAction(
+  event: ActionEvent,
+  input: { options: SlackbotV2Options; state: StateAdapter }
+): Promise<void> {
+  const logger = input.options.logger ?? noopLogger
+  const action = parseQuickAction(event.actionId, event.value)
+  if (!action || !event.thread) {
+    logger.warn('slackbotv2_quick_action_ignored', {
+      action_id: event.actionId,
+      has_thread: event.thread !== null
+    })
+    return
+  }
+  // ActionEvent is not generic over the Chat state type; this is the same thread
+  // the message handlers operate on, so the state shape is SlackbotV2ThreadState.
+  const thread = event.thread as unknown as Thread<SlackbotV2ThreadState>
+  const message = new Message({
+    attachments: [],
+    author: event.user,
+    formatted: { type: 'root', children: [] },
+    id: `quick:${action.kind}:${action.ref.siteId}:${event.triggerId ?? event.messageId}`,
+    isMention: true,
+    metadata: { dateSent: new Date(), edited: false },
+    raw: event.raw,
+    text: quickActionPrompt(action),
+    threadId: event.threadId
+  })
+  await thread.subscribe()
+  await syncThreadMessageToSession(thread, message, {
+    mode: 'execute',
+    options: input.options,
+    state: input.state
+  })
 }
 
 /**
@@ -1022,12 +1075,13 @@ async function renderExecutionStream(
   traceLog(options, 'slackbotv2_render_slack_metadata_set', trace, {
     phase_ms: elapsedMs(titleStartedAtMs)
   })
+  const finalText = { text: '' }
   try {
     const visibleStream = await streamAfterFirstChunk(
       conflateChatSdkStream(
         slackSafeChatSdkStream(
           codexAppServerToChatSdkStream(
-            stream,
+            tapTerminalText(stream, finalText),
             rendererOptions(thread, options)
           )
         )
@@ -1040,6 +1094,7 @@ async function renderExecutionStream(
         { groupTasks: options.streamTaskDisplayMode ?? 'plan' }
       )
     )
+    await maybePostQuickDeployCard(thread, finalText.text, options, trace)
   } finally {
     await setAssistantStatus(thread, '')
   }
@@ -1062,12 +1117,13 @@ async function renderRecoveredExecutionStream(
   traceLog(options, 'slackbotv2_render_slack_metadata_set', trace, {
     phase_ms: elapsedMs(titleStartedAtMs)
   })
+  const finalText = { text: '' }
   try {
     const visibleStream = await streamAfterFirstChunk(
       conflateChatSdkStream(
         slackSafeChatSdkStream(
           codexAppServerToChatSdkStream(
-            stream,
+            tapTerminalText(stream, finalText),
             rendererOptions(thread, options)
           )
         )
@@ -1083,6 +1139,7 @@ async function renderRecoveredExecutionStream(
         taskDisplayMode: options.streamTaskDisplayMode ?? 'plan'
       }
     )
+    await maybePostQuickDeployCard(thread, finalText.text, options, trace)
   } finally {
     await setAssistantStatus(thread, '')
   }
@@ -1123,6 +1180,7 @@ async function renderPlainTextExecutionStream(
       chars: text.length
     })
     await thread.post(text)
+    await maybePostQuickDeployCard(thread, fallback.text(), options, trace)
   } finally {
     await setAssistantStatus(thread, '')
   }
@@ -1155,22 +1213,61 @@ class SlackRenderFallback {
   }
 
   private captureTerminalText(event: SlackbotV2RendererSource): void {
-    if (!event || typeof event !== 'object') return
-    const eventKind = String(
-      'eventKind' in event ? event.eventKind : 'event' in event ? event.event : ''
-    )
-    if (
-      eventKind !== 'session.execution_completed' &&
-      eventKind !== 'session.execution_cancelled' &&
-      !isTerminalCodexAppServerEvent(event)
-    ) {
-      return
-    }
-    const data = 'data' in event && event.data && typeof event.data === 'object'
-      ? event.data
-      : event
-    const text = terminalResultText(data)
+    const text = terminalResultTextFromSource(event)
     if (text) this.terminalText = text
+  }
+}
+
+/** Pull the agent's terminal result text out of a single source event, or ''. */
+function terminalResultTextFromSource(event: SlackbotV2RendererSource): string {
+  if (!event || typeof event !== 'object') return ''
+  const eventKind = String(
+    'eventKind' in event ? event.eventKind : 'event' in event ? event.event : ''
+  )
+  if (
+    eventKind !== 'session.execution_completed' &&
+    eventKind !== 'session.execution_cancelled' &&
+    !isTerminalCodexAppServerEvent(event)
+  ) {
+    return ''
+  }
+  const data =
+    'data' in event && event.data && typeof event.data === 'object' ? event.data : event
+  return terminalResultText(data)
+}
+
+/** Taps a source stream, recording the latest terminal result text into `holder`. */
+async function* tapTerminalText(
+  stream: AsyncIterable<SlackbotV2RendererSource>,
+  holder: { text: string }
+): AsyncIterable<SlackbotV2RendererSource> {
+  for await (const event of stream) {
+    const text = terminalResultTextFromSource(event)
+    if (text) holder.text = text
+    yield event
+  }
+}
+
+/**
+ * Posts an interactive Quick deploy card to the thread when the agent's final
+ * answer references a Quick site URL. No-op unless QUICK_BASE_DOMAIN is set.
+ */
+async function maybePostQuickDeployCard(
+  thread: Thread,
+  text: string,
+  options: SlackbotV2Options,
+  trace?: SlackbotV2Trace
+): Promise<void> {
+  if (!options.quickBaseDomain || !text) return
+  const card = buildQuickDeployCard(text, options.quickBaseDomain)
+  if (!card) return
+  try {
+    await thread.post(card)
+    traceLog(options, 'slackbotv2_quick_card_posted', trace)
+  } catch (error) {
+    ;(options.logger ?? noopLogger).warn('slackbotv2_quick_card_post_failed', {
+      error: errorMessage(error)
+    })
   }
 }
 

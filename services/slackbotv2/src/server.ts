@@ -36,6 +36,7 @@ const options: SlackbotV2Options = {
     optionalEnv('SLACKBOTV2_DATABASE_URL') ??
     optionalEnv('DATABASE_URL') ??
     optionalEnv('POSTGRES_URL'),
+  quickBaseDomain: optionalEnv('QUICK_BASE_DOMAIN'),
   signingSecret,
   slackApiUrl: optionalEnv('SLACK_API_URL'),
   stateKeyPrefix: optionalEnv('SLACKBOTV2_STATE_KEY_PREFIX'),
