@@ -118,6 +118,8 @@ export type SlackbotV2ThreadState = {
   historyForwarded?: boolean
   lastEventId?: number
   renderObligation?: SlackbotV2RenderObligation | null
+  /** Quick site ids for which a deploy card was already posted in this thread. */
+  postedQuickCardSiteIds?: string[]
 }
 
 export type SlackbotV2RenderObligation = {

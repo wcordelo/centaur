@@ -2,7 +2,9 @@
 # quick-server — wildcard static serving for Quick-deployed agent artifacts.
 #
 # Serves sites written by the `quick` tool (local backend) from a shared PVC at
-# <root>/<site_id>, routed by Host header: <site_id>.<quick.baseDomain>. The
+# <root>/<site_id>, routed by Host header: <site_id>.<quick.baseDomain>.
+# Sandboxes get write access to the same PVC via api-rs when quick.enabled
+# (SESSION_SANDBOX_QUICK_SITES_PVC / QUICK_LOCAL_ROOT in apirs.yaml). The
 # server is deliberately auth-agnostic: production access control belongs at
 # the identity-aware proxy in front of the wildcard host —
 #   * GKE: enable quick.iap and attach the BackendConfig below (Google IAP)
@@ -63,7 +65,15 @@ spec:
         fsGroup: 65532
       containers:
         - name: quick-server
-          image: {{ .Values.quick.image | default (printf "%s:%s" .Values.api.image.repository (.Values.api.image.tag | default .Chart.AppVersion)) }}
+          {{- $quickImage := .Values.quick.image }}
+          {{- if not $quickImage }}
+          {{- if .Values.apiRs.enabled }}
+          {{- $quickImage = printf "%s:%s" .Values.apiRs.image.repository .Values.apiRs.image.tag }}
+          {{- else }}
+          {{- fail "quick.enabled requires quick.image or apiRs.enabled (api-rs image ships tools/infra/quick + python3)" }}
+          {{- end }}
+          {{- end }}
+          image: {{ $quickImage | quote }}
           command: ["python", "-m", "quick.server"]
           env:
             - name: PYTHONPATH
@@ -82,8 +92,10 @@ spec:
               port: {{ .Values.quick.service.port }}
             failureThreshold: 3
             periodSeconds: 10
+          {{- with .Values.quick.resources }}
           resources:
-{{ toYaml .Values.quick.resources | nindent 12 }}
+{{ toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: quick-sites
               mountPath: {{ .Values.quick.localRoot }}

@@ -32,7 +32,7 @@ import {
   sessionStreamError
 } from './session-api'
 import { extractMessageOverrides } from './overrides'
-import { buildQuickDeployCard, quickActionId } from './quick-card'
+import { buildQuickDeployCardFromRefs, findQuickSiteUrls, quickActionId } from './quick-card'
 import { parseQuickAction, quickActionPrompt } from './quick-actions'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
 import type {
@@ -1087,7 +1087,10 @@ async function renderExecutionStream(
         )
       )
     )
-    if (!visibleStream) return
+    if (!visibleStream) {
+      await maybePostQuickDeployCard(thread, finalText.text, options, trace)
+      return
+    }
     await thread.post(
       new StreamingPlan(
         visibleStream,
@@ -1129,7 +1132,10 @@ async function renderRecoveredExecutionStream(
         )
       )
     )
-    if (!visibleStream) return
+    if (!visibleStream) {
+      await maybePostQuickDeployCard(thread, finalText.text, options, trace)
+      return
+    }
     await thread.adapter.stream!(
       thread.id,
       visibleStream,
@@ -1259,10 +1265,22 @@ async function maybePostQuickDeployCard(
   trace?: SlackbotV2Trace
 ): Promise<void> {
   if (!options.quickBaseDomain || !text) return
-  const card = buildQuickDeployCard(text, options.quickBaseDomain)
+  const refs = findQuickSiteUrls(text, options.quickBaseDomain)
+  if (refs.length === 0) return
+
+  const state = (await thread.state) ?? {}
+  const posted = new Set(state.postedQuickCardSiteIds ?? [])
+  const newRefs = refs.filter(ref => !posted.has(ref.siteId))
+  if (newRefs.length === 0) return
+
+  const card = buildQuickDeployCardFromRefs(newRefs)
   if (!card) return
   try {
     await thread.post(card)
+    await thread.setState({
+      ...state,
+      postedQuickCardSiteIds: [...posted, ...newRefs.map(ref => ref.siteId)]
+    })
     traceLog(options, 'slackbotv2_quick_card_posted', trace)
   } catch (error) {
     ;(options.logger ?? noopLogger).warn('slackbotv2_quick_card_post_failed', {

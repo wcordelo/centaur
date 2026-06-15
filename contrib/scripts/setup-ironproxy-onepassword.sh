@@ -7,8 +7,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=../lib/env-file.sh
 source "$SCRIPT_DIR/../lib/env-file.sh"
+# shellcheck source=../lib/slack-stack.sh
+source "$SCRIPT_DIR/../lib/slack-stack.sh"
 
 NAMESPACE="${CENTAUR_NAMESPACE:-centaur}"
+RELEASE="${CENTAUR_RELEASE:-centaur}"
 VAULT="${OP_VAULT:-Private}"
 SA_NAME="${CENTAUR_OP_SA_NAME:-centaur-iron-proxy}"
 
@@ -87,10 +90,31 @@ PY
 kubectl -n "$NAMESPACE" patch secret centaur-infra-env --type merge -p "$patch_json" >/dev/null
 echo "    Patched OP_VAULT, OP_SERVICE_ACCOUNT_TOKEN, and Slack keys"
 
-echo "==> Restarting API, slackbot, and iron-proxy"
-kubectl -n "$NAMESPACE" rollout restart deployment/centaur-centaur-api deployment/centaur-centaur-slackbot deployment/centaur-api-proxy
-kubectl -n "$NAMESPACE" rollout status deployment/centaur-centaur-api --timeout=120s
-kubectl -n "$NAMESPACE" rollout status deployment/centaur-api-proxy --timeout=120s
+echo "==> Restarting deployments that consume centaur-infra-env"
+restart_targets=()
+for deploy in \
+  "${RELEASE}-centaur-api-rs" \
+  "${RELEASE}-centaur-api" \
+  "$(centaur_slackbot_v2_service 2>/dev/null || true)" \
+  "$(centaur_slackbot_v1_service 2>/dev/null || true)" \
+  "centaur-api-proxy"; do
+  [[ -n "$deploy" ]] || continue
+  if kubectl -n "$NAMESPACE" get "deployment/$deploy" >/dev/null 2>&1; then
+    restart_targets+=("$deploy")
+  fi
+done
+if [[ "${#restart_targets[@]}" -eq 0 ]]; then
+  echo "    No matching deployments in namespace $NAMESPACE"
+else
+  restart_args=()
+  for deploy in "${restart_targets[@]}"; do
+    restart_args+=("deployment/$deploy")
+  done
+  kubectl -n "$NAMESPACE" rollout restart "${restart_args[@]}"
+  for deploy in "${restart_targets[@]}"; do
+    kubectl -n "$NAMESPACE" rollout status "deployment/$deploy" --timeout=120s
+  done
+fi
 
 echo ""
 echo "Done. iron-proxy resolves: op://${VAULT}/OPENAI_API_KEY/credential"

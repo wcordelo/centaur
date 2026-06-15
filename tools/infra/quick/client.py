@@ -110,6 +110,11 @@ def _content_type(path: str) -> str:
     return guessed or "application/octet-stream"
 
 
+def is_valid_site_id(site_id: str) -> bool:
+    """Return whether ``site_id`` is a valid DNS label (defense-in-depth for the server)."""
+    return bool(_SITE_ID_RE.match(site_id.strip().lower()))
+
+
 def _validate_site_id(site_id: str) -> str:
     site_id = (site_id or "").strip().lower()
     if not _SITE_ID_RE.match(site_id):
@@ -355,6 +360,9 @@ class QuickClient:
         trash = staging_parent / f"{site_id}.trash.{uuid.uuid4().hex[:12]}"
         staging.mkdir(parents=True, exist_ok=False)
         written = []
+        live = base / site_id
+        trash_has_backup = False
+        swap_restore_failed = False
         try:
             for f in files:
                 target = (staging / f["path"]).resolve()
@@ -369,18 +377,23 @@ class QuickClient:
             manifest_file.parent.mkdir(parents=True, exist_ok=True)
             manifest_file.write_text(json.dumps(manifest, indent=2))
             # Swap: live -> trash, staging -> live. Each rename is atomic.
-            live = base / site_id
             if live.exists():
                 live.rename(trash)
+                trash_has_backup = True
             try:
                 staging.rename(live)
             except OSError:
-                if trash.exists():  # restore previous version on failure
-                    trash.rename(live)
+                if trash_has_backup and trash.exists():
+                    try:
+                        trash.rename(live)
+                    except OSError:
+                        swap_restore_failed = True
                 raise
         finally:
             shutil.rmtree(staging, ignore_errors=True)
-            shutil.rmtree(trash, ignore_errors=True)
+            # If restore failed, trash is the only copy of the previous live tree.
+            if trash_has_backup and not swap_restore_failed:
+                shutil.rmtree(trash, ignore_errors=True)
         return written
 
     def _deploy_s3(

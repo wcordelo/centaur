@@ -364,9 +364,10 @@ containerSecurityContext:
 quick:
   enabled: false
   replicaCount: 1
-  # Defaults to the API image (which contains tools/infra/quick); override to
+  # Defaults to the api-rs image (ships python3 + tools/infra/quick); override to
   # pin a dedicated image.
   image: ""
+  resources: {}
   baseDomain: quick.internal
   localRoot: /srv/quick-sites
   service:

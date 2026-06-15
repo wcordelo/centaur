@@ -844,6 +844,9 @@ pub(crate) fn apply_proxy_env(spec: &mut SandboxSpec, resolved: &ResolvedIronPro
     // collector; routing them through iron-proxy fails (plain-HTTP forwards
     // are rejected), so the endpoint host always bypasses the proxy.
     no_proxy_extra.extend(otlp_endpoint_hosts(spec));
+    // Local vLLM backends (CODEX_USE_VLLM=1) must bypass iron-proxy even when
+    // the operator did not duplicate the host in sandbox.extraEnv NO_PROXY.
+    no_proxy_extra.extend(vllm_endpoint_hosts(spec));
     let api_host = env_value(spec, "CENTAUR_API_URL").and_then(host_from_url);
     for (name, value) in proxy_env(
         &resolved.proxy_host,
@@ -1308,6 +1311,80 @@ fn otlp_endpoint_hosts(spec: &SandboxSpec) -> Vec<String> {
     .filter_map(|name| env_value(spec, name))
     .filter_map(host_from_url)
     .collect()
+}
+
+/// Hostnames permitted for local-dev vLLM sandbox egress (host gateway / loopback).
+const ALLOWLISTED_VLLM_HOSTS: &[&str] = &[
+    "host.docker.internal",
+    "host.orb.internal",
+    "localhost",
+    "127.0.0.1",
+    "::1",
+];
+
+/// When CODEX_USE_VLLM=1, mirror the allowlisted VLLM_BASE_URL host into NO_PROXY
+/// so codex reaches the local backend directly (same contract as api-rs egress holes).
+fn vllm_endpoint_hosts(spec: &SandboxSpec) -> Vec<String> {
+    let use_vllm = env_value(spec, "CODEX_USE_VLLM").is_some_and(|value| value.trim() == "1");
+    if !use_vllm {
+        return Vec::new();
+    }
+    let Some(base_url) = env_value(spec, "VLLM_BASE_URL")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+    let Some(host) = parse_vllm_base_url_host(&base_url) else {
+        return Vec::new();
+    };
+    if !is_allowlisted_vllm_host(&host) {
+        return Vec::new();
+    }
+    vec![host]
+}
+
+fn split_authority_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        let host = &authority[1..end];
+        if host.is_empty() {
+            return None;
+        }
+        let rest = authority.get(end + 1..).unwrap_or("");
+        let port = rest
+            .strip_prefix(':')
+            .and_then(|port_str| port_str.parse().ok());
+        return Some((host, port));
+    }
+    if let Some((host, port_str)) = authority.rsplit_once(':') {
+        if !host.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(port) = port_str.parse() {
+                return Some((host, Some(port)));
+            }
+        }
+    }
+    Some((authority, None))
+}
+
+fn parse_vllm_base_url_host(base_url: &str) -> Option<String> {
+    let trimmed = base_url.trim();
+    let (_, rest) = trimmed.split_once("://").unwrap_or(("http", trimmed));
+    let authority = rest.split('/').next()?.trim();
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, host_port)| host_port)
+        .unwrap_or(authority);
+    let (host, _) = split_authority_host_port(host_port)?;
+    Some(host.trim().to_ascii_lowercase())
+}
+
+fn is_allowlisted_vllm_host(host: &str) -> bool {
+    ALLOWLISTED_VLLM_HOSTS.contains(&host)
 }
 
 /// The authority (`[user@]host[:port]`) of a URL or bare `host:port`, with any
@@ -1931,5 +2008,51 @@ mod tests {
                 "{name} should contain the OTLP endpoint host: {value}"
             );
         }
+    }
+
+    #[test]
+    fn apply_proxy_env_adds_vllm_base_url_host_to_no_proxy() {
+        let mut spec = SandboxSpec::new("centaur-agent:latest")
+            .env("CODEX_USE_VLLM", "1")
+            .env("VLLM_BASE_URL", "http://host.docker.internal:8000/v1");
+
+        apply_proxy_env(&mut spec, &resolved());
+
+        for name in ["NO_PROXY", "no_proxy"] {
+            let value = spec
+                .env
+                .iter()
+                .find(|env| env.name == name)
+                .map(|env| env.value.clone())
+                .unwrap();
+            assert!(
+                value
+                    .split(',')
+                    .any(|host| host == "host.docker.internal"),
+                "{name} should contain the vLLM host: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_proxy_env_skips_non_allowlisted_vllm_host() {
+        let mut spec = SandboxSpec::new("centaur-agent:latest")
+            .env("CODEX_USE_VLLM", "1")
+            .env("VLLM_BASE_URL", "http://vllm.prod.example.com:8000/v1");
+
+        apply_proxy_env(&mut spec, &resolved());
+
+        let value = spec
+            .env
+            .iter()
+            .find(|env| env.name == "NO_PROXY")
+            .map(|env| env.value.clone())
+            .unwrap();
+        assert!(
+            !value
+                .split(',')
+                .any(|host| host == "vllm.prod.example.com"),
+            "non-allowlisted vLLM host must not be added to NO_PROXY: {value}"
+        );
     }
 }

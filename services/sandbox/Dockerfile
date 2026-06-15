@@ -192,7 +192,7 @@ RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace 
 
 FROM toolchain AS sandbox
 
-ARG SANDBOX_HARNESS=claude-code
+ARG SANDBOX_HARNESS=codex
 
 USER root
 RUN rm -f /etc/sudoers.d/agent

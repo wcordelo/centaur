@@ -73,6 +73,10 @@ spec:
             - name: SLACKBOT_TRIGGER_BOT_ALLOWLIST
               value: {{ .Values.slackbotv2.triggerBotAllowlist | quote }}
 {{- end }}
+{{- if .Values.quick.enabled }}
+            - name: QUICK_BASE_DOMAIN
+              value: {{ .Values.quick.baseDomain | quote }}
+{{- end }}
 {{- range $name, $value := .Values.slackbotv2.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}

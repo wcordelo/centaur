@@ -225,6 +225,16 @@ spec:
             - name: SESSION_SANDBOX_EXTRA_ENV
               value: {{ $sandboxEnvList | toJson | quote }}
 {{- end }}
+{{- if .Values.quick.enabled }}
+            # Shared Quick artifact tree: sandboxes write via deploy_artifact;
+            # quick-server reads the same PVC.
+            - name: SESSION_SANDBOX_QUICK_SITES_PVC
+              value: {{ include "centaur.fullname" . }}-quick-sites
+            - name: SESSION_SANDBOX_QUICK_LOCAL_ROOT
+              value: {{ .Values.quick.localRoot | quote }}
+            - name: SESSION_SANDBOX_QUICK_BASE_DOMAIN
+              value: {{ .Values.quick.baseDomain | quote }}
+{{- end }}
 {{- if .Values.ironControl.enabled }}
             # iron-control control plane: principals/roles/grants + per-sandbox
             # proxy sync. When unset, the api-rs falls back to the rendered

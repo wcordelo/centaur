@@ -1,6 +1,7 @@
 """Tests for site ownership, the deploy manifest, and the static server."""
 
 import json
+import pathlib
 import threading
 
 import httpx
@@ -92,6 +93,34 @@ def test_reserved_prefix_rejected(tmp_path):
         )
 
 
+def test_swap_failure_preserves_trash_when_restore_fails(monkeypatch, tmp_path):
+    """If swap and restore both fail, trash must not be deleted (only backup left)."""
+    client = _client(tmp_path)
+    client.deploy_artifact("demo", [{"path": "index.html", "content": "<h1>v1</h1>"}])
+
+    original_rename = pathlib.Path.rename
+
+    def flaky_rename(self, target):
+        if (
+            self.parent.name == ".staging"
+            and "trash" not in self.name
+            and target.name == "demo"
+        ):
+            raise OSError("simulate swap failure")
+        if "trash" in self.name and target.name == "demo":
+            raise OSError("simulate restore failure")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(pathlib.Path, "rename", flaky_rename)
+
+    with pytest.raises(OSError, match="simulate swap failure"):
+        client.deploy_artifact("demo", [{"path": "index.html", "content": "<h1>v2</h1>"}])
+
+    trash_dirs = list((tmp_path / ".staging").glob("demo.trash.*"))
+    assert len(trash_dirs) == 1
+    assert (trash_dirs[0] / "index.html").read_text() == "<h1>v1</h1>"
+
+
 def test_listings_hide_manifest(tmp_path):
     client = _client(tmp_path)
     client.deploy_artifact("demo", INDEX)
@@ -146,6 +175,13 @@ def test_server_hides_manifest_and_blocks_traversal(served_site):
 
 def test_server_unknown_site_404(served_site):
     resp = httpx.get(served_site, headers={"Host": "nope.quick.internal"})
+    assert resp.status_code == 404
+
+
+def test_server_rejects_invalid_site_id_label(served_site):
+    resp = httpx.get(served_site, headers={"Host": "_bad.quick.internal"})
+    assert resp.status_code == 404
+    resp = httpx.get(f"{served_site}/sites/not_valid!/index.html")
     assert resp.status_code == 404
 
 

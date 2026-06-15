@@ -56,6 +56,11 @@ export function findQuickSiteUrls(text: string, baseDomain: string): QuickSiteRe
  */
 export function buildQuickDeployCard(text: string, baseDomain: string): CardElement | null {
   const refs = findQuickSiteUrls(text, baseDomain)
+  return buildQuickDeployCardFromRefs(refs)
+}
+
+/** Build a deploy card for an explicit list of site refs (used for deduped posts). */
+export function buildQuickDeployCardFromRefs(refs: QuickSiteRef[]): CardElement | null {
   if (refs.length === 0) return null
 
   const shown = refs.slice(0, MAX_QUICK_CARD_SITES)

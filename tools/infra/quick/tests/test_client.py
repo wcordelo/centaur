@@ -7,6 +7,7 @@ from quick.client import (
     _content_type,
     _safe_relpath,
     _validate_site_id,
+    is_valid_site_id,
 )
 
 
@@ -17,12 +18,15 @@ def _client(tmp_path):
 def test_validate_site_id_accepts_dns_labels():
     assert _validate_site_id("My-App") == "my-app"
     assert _validate_site_id("abc123") == "abc123"
+    assert is_valid_site_id("a")
+    assert is_valid_site_id("0")
 
 
 @pytest.mark.parametrize("bad", ["", "-leading", "trailing-", "has_underscore", "a/b", "x" * 64])
 def test_validate_site_id_rejects_invalid(bad):
     with pytest.raises(QuickDeployError):
         _validate_site_id(bad)
+    assert not is_valid_site_id(bad)
 
 
 def test_content_type_web_defaults():

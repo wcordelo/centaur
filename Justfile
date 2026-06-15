@@ -18,7 +18,7 @@ k3s_ctr := env_var_or_default("CENTAUR_K3S_CTR", "sudo k3s ctr")
 registry := env_var_or_default("CENTAUR_LOCAL_REGISTRY", "localhost:5000")
 agent_dockerfile := env_var_or_default("CENTAUR_AGENT_DOCKERFILE", "services/sandbox/Dockerfile")
 agent_build_target := env_var_or_default("CENTAUR_AGENT_BUILD_TARGET", "sandbox")
-agent_harness := env_var_or_default("CENTAUR_SANDBOX_HARNESS", "claude-code")
+agent_harness := env_var_or_default("CENTAUR_SANDBOX_HARNESS", "codex")
 agent_image := env_var_or_default("CENTAUR_AGENT_IMAGE", "centaur-agent:latest")
 thin_agent_image := env_var_or_default("CENTAUR_THIN_AGENT_IMAGE", "centaur-agent:thin")
 

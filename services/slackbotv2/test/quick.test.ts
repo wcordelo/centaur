@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test'
 import type { ButtonElement, CardElement } from 'chat'
 import {
   buildQuickDeployCard,
+  buildQuickDeployCardFromRefs,
   findQuickSiteUrls,
   MAX_QUICK_CARD_SITES,
   quickActionId
@@ -67,6 +68,14 @@ describe('buildQuickDeployCard', () => {
 
   it('returns null when no quick url is present', () => {
     expect(buildQuickDeployCard('all done, no site here', DOMAIN)).toBeNull()
+    expect(buildQuickDeployCardFromRefs([])).toBeNull()
+  })
+
+  it('buildQuickDeployCardFromRefs accepts explicit refs', () => {
+    const card = buildQuickDeployCardFromRefs([
+      { siteId: 'demo', url: 'https://demo.quick.internal' }
+    ])
+    expect((card as CardElement).children).toHaveLength(2)
   })
 
   it('caps sites at the Slack block limit and notes omissions', () => {

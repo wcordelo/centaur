@@ -32,6 +32,7 @@ from .client import (
     DEFAULT_LOCAL_ROOT,
     MANIFEST_DIR,
     _content_type,
+    is_valid_site_id,
 )
 
 
@@ -79,7 +80,7 @@ class QuickRequestHandler(BaseHTTPRequestHandler):
         if routed is None:
             return self._error(404, "unknown site", head=head)
         site_id, rel = routed
-        if site_id.startswith("."):
+        if site_id.startswith(".") or not is_valid_site_id(site_id):
             return self._error(404, "unknown site", head=head)
 
         site_root = (self.root / site_id).resolve()
@@ -146,9 +147,9 @@ def make_server(
 def main() -> None:
     host = os.environ.get("QUICK_SERVER_HOST", "0.0.0.0")
     port = int(os.environ.get("QUICK_SERVER_PORT", "8943"))
-    server = make_server(host, port)
-    handler = server.RequestHandlerClass
-    print(f"[quick-server] serving {handler.root} on {host}:{port}")
+    configured_root = Path(os.environ.get("QUICK_LOCAL_ROOT", DEFAULT_LOCAL_ROOT))
+    server = make_server(host, port, root=str(configured_root))
+    print(f"[quick-server] serving {configured_root} on {host}:{port}")
     server.serve_forever()
 
 

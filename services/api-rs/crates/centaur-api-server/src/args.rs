@@ -553,6 +553,26 @@ struct SandboxArgs {
     /// `OTEL_SERVICE_NAME`, NO_PROXY extras) into every codex sandbox.
     #[arg(long = "session-sandbox-extra-env", env = "SESSION_SANDBOX_EXTRA_ENV")]
     extra_env_json: Option<String>,
+    /// PVC claim name for the shared Quick artifact tree (paired with
+    /// `session-sandbox-quick-local-root`). Set by the chart when `quick.enabled`.
+    #[arg(
+        long = "session-sandbox-quick-sites-pvc",
+        env = "SESSION_SANDBOX_QUICK_SITES_PVC"
+    )]
+    quick_sites_pvc: Option<String>,
+    /// Mount path inside sandboxes for the shared Quick artifact tree.
+    #[arg(
+        long = "session-sandbox-quick-local-root",
+        env = "SESSION_SANDBOX_QUICK_LOCAL_ROOT"
+    )]
+    quick_local_root: Option<String>,
+    /// Public Quick site domain (e.g. `quick.internal`) injected into sandboxes
+    /// so `deploy_artifact` returns the correct URL.
+    #[arg(
+        long = "session-sandbox-quick-base-domain",
+        env = "SESSION_SANDBOX_QUICK_BASE_DOMAIN"
+    )]
+    quick_base_domain: Option<String>,
     #[command(flatten)]
     tools: ToolDiscoveryArgs,
     #[command(flatten)]
@@ -841,6 +861,15 @@ impl SandboxArgs {
                         .read_only(),
                     );
                 }
+                if let (Some(pvc), Some(root)) = (
+                    clean_optional_value(self.quick_sites_pvc.as_deref()),
+                    clean_optional_value(self.quick_local_root.as_deref()),
+                ) {
+                    workload = workload.mount(Mount::new(
+                        MountKind::NamedVolume(pvc),
+                        root,
+                    ));
+                }
                 Ok(workload)
             }
         }
@@ -933,6 +962,13 @@ impl SandboxArgs {
             } else {
                 envs.push((name, value));
             }
+        }
+
+        if let Some(root) = clean_optional_value(self.quick_local_root.as_deref()) {
+            upsert_env_pair(&mut envs, "QUICK_LOCAL_ROOT", root);
+        }
+        if let Some(domain) = clean_optional_value(self.quick_base_domain.as_deref()) {
+            upsert_env_pair(&mut envs, "QUICK_BASE_DOMAIN", domain);
         }
 
         Ok(envs)
@@ -1720,7 +1756,37 @@ fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
 }
 
 fn parse_host_port(value: &str) -> Option<u16> {
-    value.rsplit_once(':')?.1.parse().ok()
+    let (_, port) = split_authority_host_port(value)?;
+    port
+}
+
+/// Split ``authority`` (host[:port], userinfo stripped by caller) into host and port.
+/// Bracketed IPv6 literals are handled so ``[::1]`` and ``[::1]:8000`` parse correctly.
+fn split_authority_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        let host = &authority[1..end];
+        if host.is_empty() {
+            return None;
+        }
+        let rest = authority.get(end + 1..).unwrap_or("");
+        let port = rest
+            .strip_prefix(':')
+            .and_then(|port_str| port_str.parse().ok());
+        return Some((host, port));
+    }
+    if let Some((host, port_str)) = authority.rsplit_once(':') {
+        if !host.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(port) = port_str.parse() {
+                return Some((host, Some(port)));
+            }
+        }
+    }
+    Some((authority, None))
 }
 
 /// Hostnames permitted for local-dev vLLM sandbox egress (host gateway / loopback).
@@ -1741,20 +1807,8 @@ fn parse_vllm_base_url_host(base_url: &str) -> Option<String> {
         .rsplit_once('@')
         .map(|(_, host_port)| host_port)
         .unwrap_or(authority);
-    let host = host_port
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(host_port);
-    if host.is_empty() {
-        return None;
-    }
-    let host = host.trim();
-    let host = if host.starts_with('[') && host.ends_with(']') && host.len() > 2 {
-        &host[1..host.len() - 1]
-    } else {
-        host
-    };
-    Some(host.to_ascii_lowercase())
+    let (host, _) = split_authority_host_port(host_port)?;
+    Some(host.trim().to_ascii_lowercase())
 }
 
 fn is_allowlisted_vllm_host(host: &str) -> bool {
@@ -1766,8 +1820,11 @@ fn parse_vllm_host_egress_port(base_url: &str) -> Option<u16> {
     let trimmed = base_url.trim();
     let (_, rest) = trimmed.split_once("://").unwrap_or(("http", trimmed));
     let authority = rest.split('/').next()?.trim();
-    parse_host_port(authority).or_else(|| {
-        if authority.contains(':') {
+    let (host, port) = split_authority_host_port(authority)?;
+    port.or_else(|| {
+        if authority.starts_with('[') {
+            Some(8000)
+        } else if host.contains(':') {
             None
         } else {
             Some(8000)
@@ -1811,6 +1868,15 @@ fn upsert_spec_env(spec: &mut SandboxSpec, name: String, value: String) {
     } else {
         spec.env
             .push(centaur_sandbox_core::EnvVar::new(name, value));
+    }
+}
+
+fn upsert_env_pair(envs: &mut Vec<(String, String)>, name: &str, value: String) {
+    if let Some((_, existing_value)) = envs.iter_mut().find(|(existing_name, _)| existing_name == name)
+    {
+        *existing_value = value;
+    } else {
+        envs.push((name.to_owned(), value));
     }
 }
 
@@ -2401,6 +2467,10 @@ mod tests {
             parse_vllm_base_url_host("http://[::1]:8000/v1"),
             Some("::1".to_owned())
         );
+        assert_eq!(
+            parse_vllm_base_url_host("http://[::1]/v1"),
+            Some("::1".to_owned())
+        );
         assert!(is_allowlisted_vllm_host("host.docker.internal"));
         assert!(is_allowlisted_vllm_host("::1"));
         assert!(!is_allowlisted_vllm_host("vllm.prod.example.com"));
@@ -2414,6 +2484,14 @@ mod tests {
         );
         assert_eq!(
             parse_vllm_host_egress_port("http://host.docker.internal/v1"),
+            Some(8000)
+        );
+        assert_eq!(
+            parse_vllm_host_egress_port("http://[::1]/v1"),
+            Some(8000)
+        );
+        assert_eq!(
+            parse_vllm_host_egress_port("http://[::1]:8000/v1"),
             Some(8000)
         );
     }
