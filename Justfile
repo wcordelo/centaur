@@ -18,6 +18,7 @@ k3s_ctr := env_var_or_default("CENTAUR_K3S_CTR", "sudo k3s ctr")
 registry := env_var_or_default("CENTAUR_LOCAL_REGISTRY", "localhost:5000")
 agent_dockerfile := env_var_or_default("CENTAUR_AGENT_DOCKERFILE", "services/sandbox/Dockerfile")
 agent_build_target := env_var_or_default("CENTAUR_AGENT_BUILD_TARGET", "sandbox")
+agent_harness := env_var_or_default("CENTAUR_SANDBOX_HARNESS", "claude-code")
 agent_image := env_var_or_default("CENTAUR_AGENT_IMAGE", "centaur-agent:latest")
 thin_agent_image := env_var_or_default("CENTAUR_THIN_AGENT_IMAGE", "centaur-agent:thin")
 
@@ -70,7 +71,7 @@ _build-slackbotv2:
     docker build -t centaur-slackbotv2:latest -f services/slackbotv2/Dockerfile .
 
 _build-agent:
-    docker build --target "{{agent_build_target}}" -t "{{agent_image}}" -f "{{agent_dockerfile}}" .
+    docker build --target "{{agent_build_target}}" -t "{{agent_image}}" -f "{{agent_dockerfile}}" --build-arg "SANDBOX_HARNESS={{agent_harness}}" .
 
 _build-agent-thin:
     docker build --target sandbox -t "{{thin_agent_image}}" -f services/sandbox/Dockerfile.thin .
@@ -106,6 +107,10 @@ deploy:
     #!/usr/bin/env bash
     set -euo pipefail
     helm dependency update {{chart}} >/dev/null
+    # Helm only installs subchart CRDs on first install; re-apply on every deploy.
+    if [[ -d "{{chart}}/charts/agent-sandbox/crds" ]]; then
+      kubectl apply -f "{{chart}}/charts/agent-sandbox/crds" >/dev/null
+    fi
     extra_args=()
     case "{{source}}" in
       local) ;;

@@ -1,0 +1,60 @@
+# Example overlay: local kind/k3s dev with Slack @-mentions via a tunnel.
+#
+# Uses slackbot v2 + api-rs (Rust control plane). Do not enable v1 slackbot on
+# the same Slack app — both would answer events.
+#
+# Layer on top of values.dev.yaml:
+#   CENTAUR_EXTRA_VALUES=contrib/chart/values.local-slack.example.yaml just up
+#
+# Build images first: just build-one api-rs && just build-one slackbotv2
+# (or `just build` for the full set).
+#
+# See docs/public/md/local-slack-dev.md for the full walkthrough.
+
+slackbot:
+  enabled: false
+
+api:
+  enabled: false
+  executionWorkerEnabled: false
+  pluginWatcherEnabled: false
+
+apiRs:
+  enabled: true
+
+slackbotv2:
+  enabled: true
+  assistantStatus: "Thinking..."
+
+# api-rs iron-proxy mode requires iron-control for credential sync.
+# Upstream ironsh/iron-control is amd64-only; on Apple Silicon run once:
+#   contrib/scripts/build-iron-control-local.sh
+#   kind load docker-image iron-control:local-arm64 --name centaur
+ironControl:
+  enabled: true
+  image:
+    repository: iron-control
+    tag: local-arm64
+    pullPolicy: IfNotPresent
+
+# Codex harness (must match agent image build + sandbox.harnessEngine):
+#   CENTAUR_SANDBOX_HARNESS=codex just build-one agent
+#   kind load docker-image centaur-agent:latest --name centaur
+#
+# LLM backend (pick one):
+#   A) OpenAI (default below) — set OPENAI_API_KEY in .env, run sync-local-env.sh.
+#   B) Local Gemma via vLLM — uncomment extraEnv block; start vLLM on :8000.
+#      Gemma 4 E2B emits Codex <|channel> control tokens; Slack replies are broken
+#      until we add stripping or use a non-E2B checkpoint. Dev-only egress hole.
+sandbox:
+  harnessEngine: codex
+  extraEnv: {}
+  # extraEnv:
+  #   CODEX_USE_VLLM: "1"
+  #   VLLM_API_KEY: local
+  #   VLLM_BASE_URL: http://host.docker.internal:8000/v1
+  #   CODEX_MODEL: gemma
+  #   NO_PROXY: host.docker.internal,host.orb.internal
+
+ironProxy:
+  secretSource: env

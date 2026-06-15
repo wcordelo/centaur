@@ -323,6 +323,7 @@ impl AgentSandboxBackend {
             iron_proxy,
             control_port,
             self.config.otlp_egress.as_ref(),
+            &self.config.host_egress_ports,
         ) {
             self.network_policies()
                 .create(&PostParams::default(), &policy)
@@ -1079,6 +1080,7 @@ fn build_iron_proxy_network_policies(
     iron_proxy: &IronProxyConfig,
     control_port: u16,
     otlp_egress: Option<&OtlpEgressTarget>,
+    host_egress_ports: &[u16],
 ) -> Vec<NetworkPolicy> {
     let sandbox_to_proxy_ports = sandbox_to_proxy_ports(resolved);
     let mut sandbox_egress = vec![
@@ -1100,6 +1102,14 @@ fn build_iron_proxy_network_policies(
             vec![namespace_peer(&target.namespace)],
             vec![network_port(target.port)],
         ));
+    }
+    for port in host_egress_ports {
+        // Local dev vLLM on the host gateway. api-rs only populates this after
+        // validating CODEX_USE_VLLM=1 and an allowlisted VLLM_BASE_URL host.
+        sandbox_egress.push(NetworkPolicyEgressRule {
+            ports: Some(vec![network_port(*port)]),
+            ..Default::default()
+        });
     }
     vec![
         NetworkPolicy {
@@ -1574,7 +1584,7 @@ mod tests {
         };
 
         let policies =
-            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, Some(&target));
+            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, Some(&target), &[]);
         let sandbox_egress = policies[0]
             .spec
             .as_ref()
@@ -1589,7 +1599,7 @@ mod tests {
                 .any(|rule| rule_allows_namespace_port(rule, "laminar", 8000))
         );
 
-        let policies = build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None);
+        let policies = build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None, &[]);
         let sandbox_egress = policies[0]
             .spec
             .as_ref()
@@ -1610,7 +1620,7 @@ mod tests {
         let id = SandboxId::new("asbx-test");
         let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
 
-        let policies = build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None);
+        let policies = build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None, &[]);
         let ingress = policies[1]
             .spec
             .as_ref()
@@ -1863,6 +1873,39 @@ mod tests {
         .await;
 
         assert_eq!(ack, ProxyAck::ManagementUnavailable);
+    }
+
+    #[test]
+    fn sandbox_egress_policy_allows_host_port_when_configured() {
+        let id = SandboxId::new("asbx-test");
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+
+        let policies = build_iron_proxy_network_policies(
+            &id,
+            &resolved(),
+            &iron_proxy,
+            3000,
+            None,
+            &[8000],
+        );
+        let sandbox_egress = policies[0]
+            .spec
+            .as_ref()
+            .unwrap()
+            .egress
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(
+            sandbox_egress.iter().any(|rule| {
+                rule.to.is_none()
+                    && rule.ports.as_ref().is_some_and(|ports| {
+                        ports.iter().any(|policy_port| {
+                            policy_port.port == Some(IntOrString::Int(8000))
+                        })
+                    })
+            })
+        );
     }
 
     #[test]
