@@ -181,7 +181,7 @@ model = os.environ.get("CODEX_MODEL", "").strip()
 base_url = os.environ.get("VLLM_BASE_URL", "").strip()
 if model:
     lines = [
-        (f'model = "{model}"' if line.startswith("model = ") else line)
+        (f'model = "{model}"' if line.strip().startswith("model = ") else line)
         for line in lines
     ]
 if base_url:

@@ -78,9 +78,8 @@ spec:
             - containerPort: {{ .Values.quick.service.port }}
           readinessProbe:
             httpGet:
-              path: /sites/healthcheck-not-a-site/
+              path: /healthz
               port: {{ .Values.quick.service.port }}
-            # 404 means the server is up; accept any HTTP response.
             failureThreshold: 3
             periodSeconds: 10
           resources:

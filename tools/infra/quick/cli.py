@@ -5,9 +5,19 @@ import json
 from pathlib import Path
 
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 
 from centaur_sdk import Table
+
+from .client import QuickClient
+
+_cli_env = Path(__file__).parent / ".env"
+_repo_env = Path(__file__).parent.parent.parent.parent / ".env"
+for _env_file in (_cli_env, _repo_env):
+    if _env_file.exists():
+        load_dotenv(_env_file)
+        break
 
 app = typer.Typer(name="quick", help="Deploy static web artifacts (HTML/JS/CSS)")
 console = Console()
@@ -29,19 +39,8 @@ _TEXT_EXT = {
 }
 
 
-def get_client():
-    """Load .env (local/standalone use) and return a QuickClient."""
-    from dotenv import load_dotenv
-
-    cli_env = Path(__file__).parent / ".env"
-    repo_env = Path(__file__).parent.parent.parent.parent / ".env"
-    for env_file in (cli_env, repo_env):
-        if env_file.exists():
-            load_dotenv(env_file)
-            break
-
-    from .client import QuickClient
-
+def get_client() -> QuickClient:
+    """Return a QuickClient (env loaded at module import)."""
     return QuickClient()
 
 

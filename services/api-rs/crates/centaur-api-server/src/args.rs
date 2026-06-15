@@ -1748,6 +1748,12 @@ fn parse_vllm_base_url_host(base_url: &str) -> Option<String> {
     if host.is_empty() {
         return None;
     }
+    let host = host.trim();
+    let host = if host.starts_with('[') && host.ends_with(']') && host.len() > 2 {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    };
     Some(host.to_ascii_lowercase())
 }
 
@@ -2391,7 +2397,12 @@ mod tests {
             parse_vllm_base_url_host("http://127.0.0.1:8000/v1"),
             Some("127.0.0.1".to_owned())
         );
+        assert_eq!(
+            parse_vllm_base_url_host("http://[::1]:8000/v1"),
+            Some("::1".to_owned())
+        );
         assert!(is_allowlisted_vllm_host("host.docker.internal"));
+        assert!(is_allowlisted_vllm_host("::1"));
         assert!(!is_allowlisted_vllm_host("vllm.prod.example.com"));
     }
 

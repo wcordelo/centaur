@@ -62,33 +62,44 @@ class QuickRequestHandler(BaseHTTPRequestHandler):
         self._serve(head=True)
 
     def _serve(self, *, head: bool) -> None:
+        path = unquote(urlsplit(self.path).path)
+        if path in ("/healthz", "/health"):
+            body = b"ok\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if not head:
+                self.wfile.write(body)
+            return
+
         routed = _resolve_site_and_path(
             self.headers.get("Host", ""), self.path, self.base_domain
         )
         if routed is None:
-            return self._error(404, "unknown site")
+            return self._error(404, "unknown site", head=head)
         site_id, rel = routed
         if site_id.startswith("."):
-            return self._error(404, "unknown site")
+            return self._error(404, "unknown site", head=head)
 
         site_root = (self.root / site_id).resolve()
         base = self.root.resolve()
         if not site_root.is_dir() or site_root.parent != base:
-            return self._error(404, "unknown site")
+            return self._error(404, "unknown site", head=head)
 
         rel = rel or DEFAULT_INDEX
         target = (site_root / rel).resolve()
         # Defense in depth: stay inside the site root, never expose metadata.
         if site_root != target and site_root not in target.parents:
-            return self._error(403, "forbidden")
+            return self._error(403, "forbidden", head=head)
         rel_parts = target.relative_to(site_root).parts if target != site_root else ()
         if any(p == MANIFEST_DIR or p.startswith(".") for p in rel_parts):
-            return self._error(404, "not found")
+            return self._error(404, "not found", head=head)
 
         if target.is_dir():
             target = target / DEFAULT_INDEX
         if not target.is_file():
-            return self._error(404, "not found")
+            return self._error(404, "not found", head=head)
 
         data = target.read_bytes()
         self.send_response(200)
@@ -99,13 +110,14 @@ class QuickRequestHandler(BaseHTTPRequestHandler):
         if not head:
             self.wfile.write(data)
 
-    def _error(self, code: int, message: str) -> None:
+    def _error(self, code: int, message: str, *, head: bool = False) -> None:
         body = message.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if not head:
+            self.wfile.write(body)
 
     def log_message(self, fmt: str, *args: object) -> None:
         host = self.headers.get("Host", "-")
@@ -135,7 +147,8 @@ def main() -> None:
     host = os.environ.get("QUICK_SERVER_HOST", "0.0.0.0")
     port = int(os.environ.get("QUICK_SERVER_PORT", "8943"))
     server = make_server(host, port)
-    print(f"[quick-server] serving {QuickRequestHandler.root} on {host}:{port}")
+    handler = server.RequestHandlerClass
+    print(f"[quick-server] serving {handler.root} on {host}:{port}")
     server.serve_forever()
 
 

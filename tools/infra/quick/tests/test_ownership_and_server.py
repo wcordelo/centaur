@@ -51,6 +51,20 @@ def test_owner_can_redeploy_and_delete(tmp_path):
     assert not (tmp_path / "demo").exists()
 
 
+def test_owner_reads_quick_requester_per_operation(monkeypatch, tmp_path):
+    owners = iter(["alice", "bob"])
+
+    def fake_cfg(key: str, default: str) -> str:
+        if key == "QUICK_REQUESTER":
+            return next(owners)
+        return default
+
+    monkeypatch.setattr("quick.client._cfg", fake_cfg)
+    client = QuickClient(backend="local", base_domain="quick.internal", local_root=str(tmp_path))
+    assert client.owner == "alice"
+    assert client.owner == "bob"
+
+
 # -- atomic redeploy / stale cleanup -------------------------------------------
 
 
@@ -133,3 +147,9 @@ def test_server_hides_manifest_and_blocks_traversal(served_site):
 def test_server_unknown_site_404(served_site):
     resp = httpx.get(served_site, headers={"Host": "nope.quick.internal"})
     assert resp.status_code == 404
+
+
+def test_server_healthz(served_site):
+    resp = httpx.get(f"{served_site}/healthz")
+    assert resp.status_code == 200
+    assert resp.text == "ok\n"

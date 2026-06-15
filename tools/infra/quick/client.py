@@ -20,6 +20,7 @@ the lifecycle controls the Slack card exposes ([Re-generate]/[View Logs]/[Delete
 
 from __future__ import annotations
 
+import base64
 import json
 import mimetypes
 import re
@@ -142,8 +143,6 @@ def _safe_relpath(raw_path: str) -> str:
 
 def _decode_content(content: str, encoding: str) -> bytes:
     if encoding == "base64":
-        import base64
-
         try:
             return base64.b64decode(content, validate=True)
         except (ValueError, TypeError) as exc:
@@ -181,14 +180,21 @@ class QuickClient:
         self.public_base_url = (
             (public_base_url or _cfg("QUICK_PUBLIC_BASE_URL", "")).strip().rstrip("/")
         )
-        # Requester identity (Centaur injects this for the active requester).
-        # Used to stamp manifests and gate redeploy/delete of existing sites.
-        self.owner = (owner or _cfg("QUICK_REQUESTER", DEFAULT_OWNER)).strip() or DEFAULT_OWNER
+        # Requester identity (Centaur injects QUICK_REQUESTER per tool call).
+        # Resolved lazily so a cached QuickClient still sees the active requester.
+        self._owner_override = owner
         self.enforce_ownership = (
             _cfg("QUICK_OWNERSHIP_ENFORCE", "true").strip().lower() != "false"
         )
         self.timeout = timeout
         self._http: httpx.Client | None = None
+
+    @property
+    def owner(self) -> str:
+        """Active requester for ownership checks and manifest stamping."""
+        if self._owner_override is not None:
+            return self._owner_override.strip() or DEFAULT_OWNER
+        return _cfg("QUICK_REQUESTER", DEFAULT_OWNER).strip() or DEFAULT_OWNER
 
     # -- public tool methods --------------------------------------------------
 
