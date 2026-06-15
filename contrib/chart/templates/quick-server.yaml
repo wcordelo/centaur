@@ -1,0 +1,161 @@
+{{- if .Values.quick.enabled }}
+# quick-server — wildcard static serving for Quick-deployed agent artifacts.
+#
+# Serves sites written by the `quick` tool (local backend) from a shared PVC at
+# <root>/<site_id>, routed by Host header: <site_id>.<quick.baseDomain>.
+# Sandboxes get write access to the same PVC via api-rs when quick.enabled
+# (SESSION_SANDBOX_QUICK_SITES_PVC / QUICK_LOCAL_ROOT in apirs.yaml). The
+# server is deliberately auth-agnostic: production access control belongs at
+# the identity-aware proxy in front of the wildcard host —
+#   * GKE: enable quick.iap and attach the BackendConfig below (Google IAP)
+#   * Cloudflare: front *.<baseDomain> with a Cloudflare Access application
+# Either way, unauthenticated requests never reach this pod.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "centaur.fullname" . }}-quick-sites
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "quick-server") | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteMany"]
+  {{- with .Values.quick.persistence.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.quick.persistence.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "centaur.fullname" . }}-quick-server
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "quick-server") | nindent 4 }}
+  {{- if .Values.quick.iap.enabled }}
+  annotations:
+    cloud.google.com/backend-config: '{"default": "{{ include "centaur.fullname" . }}-quick-iap"}'
+  {{- end }}
+spec:
+  selector:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "quick-server") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.quick.service.port }}
+      targetPort: {{ .Values.quick.service.port }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "centaur.fullname" . }}-quick-server
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "quick-server") | nindent 4 }}
+spec:
+  replicas: {{ .Values.quick.replicaCount }}
+  selector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "quick-server") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "quick-server") | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+        - name: quick-server
+          {{- $quickImage := .Values.quick.image }}
+          {{- if not $quickImage }}
+          {{- if .Values.apiRs.enabled }}
+          {{- $quickImage = printf "%s:%s" .Values.apiRs.image.repository .Values.apiRs.image.tag }}
+          {{- else }}
+          {{- fail "quick.enabled requires quick.image or apiRs.enabled (api-rs image ships tools/infra/quick + python3)" }}
+          {{- end }}
+          {{- end }}
+          image: {{ $quickImage | quote }}
+          command: ["python", "-m", "quick.server"]
+          env:
+            - name: PYTHONPATH
+              value: /app/tools/infra
+            - name: QUICK_LOCAL_ROOT
+              value: {{ .Values.quick.localRoot | quote }}
+            - name: QUICK_BASE_DOMAIN
+              value: {{ .Values.quick.baseDomain | quote }}
+            - name: QUICK_SERVER_PORT
+              value: {{ .Values.quick.service.port | quote }}
+          ports:
+            - containerPort: {{ .Values.quick.service.port }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.quick.service.port }}
+            failureThreshold: 3
+            periodSeconds: 10
+          {{- with .Values.quick.resources }}
+          resources:
+{{ toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: quick-sites
+              mountPath: {{ .Values.quick.localRoot }}
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: quick-sites
+          persistentVolumeClaim:
+            claimName: {{ include "centaur.fullname" . }}-quick-sites
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "centaur.fullname" . }}-quick
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "quick-server") | nindent 4 }}
+  {{- with .Values.quick.ingress.annotations }}
+  annotations:
+{{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.quick.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  rules:
+    - host: {{ printf "*.%s" .Values.quick.baseDomain | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "centaur.fullname" . }}-quick-server
+                port:
+                  number: {{ .Values.quick.service.port }}
+  {{- with .Values.quick.ingress.tlsSecretName }}
+  tls:
+    - hosts:
+        - {{ printf "*.%s" $.Values.quick.baseDomain | quote }}
+      secretName: {{ . }}
+  {{- end }}
+{{- if .Values.quick.iap.enabled }}
+---
+# Google IAP gating (GKE): every request to *.<baseDomain> must carry a valid
+# IAP identity before it reaches quick-server. The oauth client secret is the
+# standard IAP OAuth credential, provisioned out-of-band.
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: {{ include "centaur.fullname" . }}-quick-iap
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "quick-server") | nindent 4 }}
+spec:
+  iap:
+    enabled: true
+    oauthclientCredentials:
+      secretName: {{ .Values.quick.iap.oauthSecretName }}
+{{- end }}
+{{- end }}

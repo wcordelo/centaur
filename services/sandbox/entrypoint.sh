@@ -137,8 +137,17 @@ if [ -n "${CENTAUR_TRACE_ID:-}" ]; then
 fi
 
 HARNESS_CONFIG_DIR="${CENTAUR_HARNESS_CONFIG_DIR:-$HOME_DIR/harness}"
-if [ -f "$HARNESS_CONFIG_DIR/codex/config.toml" ]; then
-    cp "$HARNESS_CONFIG_DIR/codex/config.toml" "$HOME_DIR/.codex/config.toml"
+if [ "${CODEX_USE_VLLM:-0}" = "1" ] || [ "${CODEX_MODEL_PROVIDER:-}" = "vllm" ]; then
+    CODEX_USE_VLLM=1
+else
+    CODEX_USE_VLLM=0
+fi
+CODEX_CONFIG_REL="codex/config.toml"
+if [ "$CODEX_USE_VLLM" = "1" ]; then
+    CODEX_CONFIG_REL="codex/config.vllm.toml"
+fi
+if [ -f "$HARNESS_CONFIG_DIR/$CODEX_CONFIG_REL" ]; then
+    cp "$HARNESS_CONFIG_DIR/$CODEX_CONFIG_REL" "$HOME_DIR/.codex/config.toml"
     CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" python3 - <<'PYEOF'
 from pathlib import Path
 import os
@@ -167,10 +176,28 @@ else:
     for name in sorted(feature_names - seen):
         rewritten.append(f"{name} = false")
     lines = lines[: features_start + 1] + rewritten + lines[features_end:]
+
+model = os.environ.get("CODEX_MODEL", "").strip()
+base_url = os.environ.get("VLLM_BASE_URL", "").strip()
+if model:
+    lines = [
+        (f'model = "{model}"' if line.strip().startswith("model = ") else line)
+        for line in lines
+    ]
+if base_url:
+    lines = [
+        (
+            f'base_url = "{base_url.rstrip("/")}"'
+            if line.strip().startswith("base_url = ")
+            else line
+        )
+        for line in lines
+    ]
+
 path.write_text("\n".join(lines).rstrip() + "\n")
 PYEOF
 else
-    echo "missing Codex harness config: $HARNESS_CONFIG_DIR/codex/config.toml" >&2
+    echo "missing Codex harness config: $HARNESS_CONFIG_DIR/$CODEX_CONFIG_REL" >&2
     exit 1
 fi
 
@@ -305,7 +332,7 @@ fi
 # signaling readiness, otherwise warm pods can be claimed with no auth loaded.
 # Skipped under access_token mode — that path relies on the chatgpt auth.json
 # installed above plus iron-proxy injecting the real Bearer at request time.
-if [ "$CODEX_AUTH_MODE" != "access_token" ]; then
+if [ "$CODEX_AUTH_MODE" != "access_token" ] && [ "$CODEX_USE_VLLM" != "1" ]; then
     CODEX_KEY="${CODEX_API_KEY:-${OPENAI_API_KEY:-}}"
     if [ -n "$CODEX_KEY" ]; then
         echo "$CODEX_KEY" | codex login --with-api-key 2>/dev/null || true

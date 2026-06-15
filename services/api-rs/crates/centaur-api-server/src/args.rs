@@ -553,6 +553,26 @@ struct SandboxArgs {
     /// `OTEL_SERVICE_NAME`, NO_PROXY extras) into every codex sandbox.
     #[arg(long = "session-sandbox-extra-env", env = "SESSION_SANDBOX_EXTRA_ENV")]
     extra_env_json: Option<String>,
+    /// PVC claim name for the shared Quick artifact tree (paired with
+    /// `session-sandbox-quick-local-root`). Set by the chart when `quick.enabled`.
+    #[arg(
+        long = "session-sandbox-quick-sites-pvc",
+        env = "SESSION_SANDBOX_QUICK_SITES_PVC"
+    )]
+    quick_sites_pvc: Option<String>,
+    /// Mount path inside sandboxes for the shared Quick artifact tree.
+    #[arg(
+        long = "session-sandbox-quick-local-root",
+        env = "SESSION_SANDBOX_QUICK_LOCAL_ROOT"
+    )]
+    quick_local_root: Option<String>,
+    /// Public Quick site domain (e.g. `quick.internal`) injected into sandboxes
+    /// so `deploy_artifact` returns the correct URL.
+    #[arg(
+        long = "session-sandbox-quick-base-domain",
+        env = "SESSION_SANDBOX_QUICK_BASE_DOMAIN"
+    )]
+    quick_base_domain: Option<String>,
     #[command(flatten)]
     tools: ToolDiscoveryArgs,
     #[command(flatten)]
@@ -841,6 +861,12 @@ impl SandboxArgs {
                         .read_only(),
                     );
                 }
+                if let (Some(pvc), Some(root)) = (
+                    clean_optional_value(self.quick_sites_pvc.as_deref()),
+                    clean_optional_value(self.quick_local_root.as_deref()),
+                ) {
+                    workload = workload.mount(Mount::new(MountKind::NamedVolume(pvc), root));
+                }
                 Ok(workload)
             }
         }
@@ -935,6 +961,13 @@ impl SandboxArgs {
             }
         }
 
+        if let Some(root) = clean_optional_value(self.quick_local_root.as_deref()) {
+            upsert_env_pair(&mut envs, "QUICK_LOCAL_ROOT", root);
+        }
+        if let Some(domain) = clean_optional_value(self.quick_base_domain.as_deref()) {
+            upsert_env_pair(&mut envs, "QUICK_BASE_DOMAIN", domain);
+        }
+
         Ok(envs)
     }
 
@@ -1020,6 +1053,61 @@ impl SandboxArgs {
                 Ok(None)
             }
         }
+    }
+
+    /// Host-reachable ports for local vLLM. Requires `CODEX_USE_VLLM=1` and an
+    /// allowlisted `VLLM_BASE_URL` host (host gateway / loopback only).
+    fn sandbox_host_egress_ports(&self) -> Result<Vec<u16>, ServerError> {
+        if !matches!(self.workload, SandboxWorkloadKind::CodexAppServer) {
+            return Ok(Vec::new());
+        }
+        let envs = self.codex_app_server_env_template()?;
+        let use_vllm = envs
+            .iter()
+            .any(|(name, value)| name == "CODEX_USE_VLLM" && value.trim() == "1");
+        if !use_vllm {
+            return Ok(Vec::new());
+        }
+        let base_url = envs
+            .iter()
+            .find(|(name, _)| name == "VLLM_BASE_URL")
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty());
+        let Some(base_url) = base_url else {
+            warn!(
+                "CODEX_USE_VLLM=1 but VLLM_BASE_URL is unset; \
+                 sandbox host egress NetworkPolicy will not be created"
+            );
+            return Ok(Vec::new());
+        };
+        let Some(host) = parse_vllm_base_url_host(base_url) else {
+            warn!(
+                base_url,
+                "VLLM_BASE_URL could not be parsed; sandbox host egress disabled"
+            );
+            return Ok(Vec::new());
+        };
+        if !is_allowlisted_vllm_host(&host) {
+            warn!(
+                host = %host,
+                base_url,
+                allowlisted = ?ALLOWLISTED_VLLM_HOSTS,
+                "VLLM_BASE_URL host is not allowlisted for sandbox egress; \
+                 NetworkPolicy hole will NOT be created. Use host.docker.internal, \
+                 host.orb.internal, localhost, or 127.0.0.1 for local dev only."
+            );
+            return Ok(Vec::new());
+        }
+        let port = parse_vllm_host_egress_port(base_url).unwrap_or(8000);
+        warn!(
+            port,
+            host = %host,
+            base_url,
+            "SECURITY: sandbox host egress enabled — codex sandboxes may reach \
+             the configured vLLM TCP port on any destination (port-scoped, not \
+             host-scoped). Dev-only; never deploy CODEX_USE_VLLM in production."
+        );
+        Ok(vec![port])
     }
 
     fn workflow_host_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
@@ -1190,6 +1278,7 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         // the per-sandbox egress NetworkPolicy; derived from the sandbox's own
         // OTLP endpoint env so there is a single source of truth.
         config.otlp_egress = args.sandbox_otlp_egress_target()?;
+        config.host_egress_ports = args.sandbox_host_egress_ports()?;
         // iron-control is the only proxy mode: a per-sandbox proxy syncs its
         // secrets from the control plane, so configuring iron-proxy without
         // iron-control would produce a non-functional proxy. Fail fast.
@@ -1664,7 +1753,80 @@ fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
 }
 
 fn parse_host_port(value: &str) -> Option<u16> {
-    value.rsplit_once(':')?.1.parse().ok()
+    let (_, port) = split_authority_host_port(value)?;
+    port
+}
+
+/// Split ``authority`` (host[:port], userinfo stripped by caller) into host and port.
+/// Bracketed IPv6 literals are handled so ``[::1]`` and ``[::1]:8000`` parse correctly.
+fn split_authority_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        let host = &authority[1..end];
+        if host.is_empty() {
+            return None;
+        }
+        let rest = authority.get(end + 1..).unwrap_or("");
+        let port = rest
+            .strip_prefix(':')
+            .and_then(|port_str| port_str.parse().ok());
+        return Some((host, port));
+    }
+    if let Some((host, port_str)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && port_str.chars().all(|c| c.is_ascii_digit())
+        && let Ok(port) = port_str.parse()
+    {
+        return Some((host, Some(port)));
+    }
+    Some((authority, None))
+}
+
+/// Hostnames permitted for local-dev vLLM sandbox egress (host gateway / loopback).
+const ALLOWLISTED_VLLM_HOSTS: &[&str] = &[
+    "host.docker.internal",
+    "host.orb.internal",
+    "localhost",
+    "127.0.0.1",
+    "::1",
+];
+
+/// Host part of `VLLM_BASE_URL` (lowercased, without port).
+fn parse_vllm_base_url_host(base_url: &str) -> Option<String> {
+    let trimmed = base_url.trim();
+    let (_, rest) = trimmed.split_once("://").unwrap_or(("http", trimmed));
+    let authority = rest.split('/').next()?.trim();
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, host_port)| host_port)
+        .unwrap_or(authority);
+    let (host, _) = split_authority_host_port(host_port)?;
+    Some(host.trim().to_ascii_lowercase())
+}
+
+fn is_allowlisted_vllm_host(host: &str) -> bool {
+    ALLOWLISTED_VLLM_HOSTS.contains(&host)
+}
+
+/// Port for host-reachable vLLM backends (e.g. `http://host.docker.internal:8000/v1`).
+fn parse_vllm_host_egress_port(base_url: &str) -> Option<u16> {
+    let trimmed = base_url.trim();
+    let (_, rest) = trimmed.split_once("://").unwrap_or(("http", trimmed));
+    let authority = rest.split('/').next()?.trim();
+    let (host, port) = split_authority_host_port(authority)?;
+    port.or_else(|| {
+        if authority.starts_with('[') {
+            Some(8000)
+        } else if host.contains(':') {
+            None
+        } else {
+            Some(8000)
+        }
+    })
 }
 
 /// Map an OTLP endpoint URL onto a NetworkPolicy egress target. Only
@@ -1703,6 +1865,17 @@ fn upsert_spec_env(spec: &mut SandboxSpec, name: String, value: String) {
     } else {
         spec.env
             .push(centaur_sandbox_core::EnvVar::new(name, value));
+    }
+}
+
+fn upsert_env_pair(envs: &mut Vec<(String, String)>, name: &str, value: String) {
+    if let Some((_, existing_value)) = envs
+        .iter_mut()
+        .find(|(existing_name, _)| existing_name == name)
+    {
+        *existing_value = value;
+    } else {
+        envs.push((name.to_owned(), value));
     }
 }
 
@@ -2196,6 +2369,126 @@ mod tests {
         assert_eq!(
             parse_otlp_egress_target("http://laminar-app-server.laminar:8000"),
             None
+        );
+    }
+
+    #[test]
+    fn sandbox_host_egress_ports_derived_from_vllm_extra_env() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--session-sandbox-extra-env",
+            r#"[{"name":"CODEX_USE_VLLM","value":"1"},{"name":"VLLM_BASE_URL","value":"http://host.docker.internal:8000/v1"}]"#,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox.sandbox_host_egress_ports().unwrap(),
+            vec![8000]
+        );
+    }
+
+    #[test]
+    fn sandbox_host_egress_ports_requires_codex_use_vllm_flag() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--session-sandbox-extra-env",
+            r#"[{"name":"VLLM_BASE_URL","value":"http://host.docker.internal:8000/v1"}]"#,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox.sandbox_host_egress_ports().unwrap(),
+            Vec::<u16>::new()
+        );
+    }
+
+    #[test]
+    fn sandbox_host_egress_ports_rejects_non_allowlisted_host() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--session-sandbox-extra-env",
+            r#"[{"name":"CODEX_USE_VLLM","value":"1"},{"name":"VLLM_BASE_URL","value":"http://vllm.prod.example.com:8000/v1"}]"#,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox.sandbox_host_egress_ports().unwrap(),
+            Vec::<u16>::new()
+        );
+    }
+
+    #[test]
+    fn sandbox_host_egress_ports_requires_vllm_base_url_when_enabled() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--session-sandbox-extra-env",
+            r#"[{"name":"CODEX_USE_VLLM","value":"1"}]"#,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox.sandbox_host_egress_ports().unwrap(),
+            Vec::<u16>::new()
+        );
+    }
+
+    #[test]
+    fn parse_vllm_base_url_host_extracts_allowlisted_hosts() {
+        assert_eq!(
+            parse_vllm_base_url_host("http://host.docker.internal:8000/v1"),
+            Some("host.docker.internal".to_owned())
+        );
+        assert_eq!(
+            parse_vllm_base_url_host("http://HOST.ORB.INTERNAL/v1"),
+            Some("host.orb.internal".to_owned())
+        );
+        assert_eq!(
+            parse_vllm_base_url_host("http://127.0.0.1:8000/v1"),
+            Some("127.0.0.1".to_owned())
+        );
+        assert_eq!(
+            parse_vllm_base_url_host("http://[::1]:8000/v1"),
+            Some("::1".to_owned())
+        );
+        assert_eq!(
+            parse_vllm_base_url_host("http://[::1]/v1"),
+            Some("::1".to_owned())
+        );
+        assert!(is_allowlisted_vllm_host("host.docker.internal"));
+        assert!(is_allowlisted_vllm_host("::1"));
+        assert!(!is_allowlisted_vllm_host("vllm.prod.example.com"));
+    }
+
+    #[test]
+    fn parse_vllm_host_egress_port_extracts_port_from_base_url() {
+        assert_eq!(
+            parse_vllm_host_egress_port("http://host.docker.internal:8000/v1"),
+            Some(8000)
+        );
+        assert_eq!(
+            parse_vllm_host_egress_port("http://host.docker.internal/v1"),
+            Some(8000)
+        );
+        assert_eq!(parse_vllm_host_egress_port("http://[::1]/v1"), Some(8000));
+        assert_eq!(
+            parse_vllm_host_egress_port("http://[::1]:8000/v1"),
+            Some(8000)
         );
     }
 

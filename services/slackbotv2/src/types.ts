@@ -88,6 +88,11 @@ export type SlackbotV2Options = {
   logger?: Logger
   maxDurationMs?: number
   postgresUrl?: string
+  /**
+   * Base domain for Quick static sites (e.g. `quick.internal`). When set, final
+   * agent replies that contain a Quick site URL get an interactive deploy card.
+   */
+  quickBaseDomain?: string
   recoverRenderObligationsOnStart?: boolean
   /** Per-thread deadline for one recovery attempt during the startup scan. */
   renderRecoveryThreadTimeoutMs?: number
@@ -113,6 +118,8 @@ export type SlackbotV2ThreadState = {
   historyForwarded?: boolean
   lastEventId?: number
   renderObligation?: SlackbotV2RenderObligation | null
+  /** Quick site ids for which a deploy card was already posted in this thread. */
+  postedQuickCardSiteIds?: string[]
 }
 
 export type SlackbotV2RenderObligation = {

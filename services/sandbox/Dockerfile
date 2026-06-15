@@ -192,12 +192,15 @@ RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace 
 
 FROM toolchain AS sandbox
 
+ARG SANDBOX_HARNESS=codex
+
 USER root
 RUN rm -f /etc/sudoers.d/agent
 # BuildKit's COPY --link creates parent directories without an explicit mode,
 # which can leave /etc/centaur without the execute bit for non-root users.
 # Pre-create it as 0755 so the agent user can traverse into it at runtime.
-RUN install -d -m 0755 /etc/centaur /opt/centaur
+RUN install -d -m 0755 /etc/centaur /opt/centaur \
+    && printf '%s' "$SANDBOX_HARNESS" > /etc/centaur/sandbox-harness
 COPY --link centaur_sdk/ /opt/centaur/centaur_sdk/
 COPY --link --chmod=644 services/sandbox/codex-auth.json /etc/centaur/codex-auth.default.json
 COPY --link --chmod=644 services/sandbox/claude-credentials.json /etc/centaur/claude-credentials.default.json
@@ -232,4 +235,6 @@ COPY --link --chown=1001:1001 services/sandbox/SYSTEM_PROMPT.md /home/agent/AGEN
 
 ENTRYPOINT ["/entrypoint.sh"]
 # Default CMD uses Rust blocks mode; pass --mode=jsonrpc for raw App Server JSON-RPC.
-CMD ["harness-server", "codex"]
+# Build with --build-arg SANDBOX_HARNESS=codex for OpenAI/local dev; must agree with
+# sandbox.harnessEngine in contrib/chart (claudecode is preview dogfood default).
+CMD ["sh", "-c", "exec harness-server \"$(cat /etc/centaur/sandbox-harness)\""]
