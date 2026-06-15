@@ -769,3 +769,71 @@ kubectl exec -n centaur deploy/centaur-centaur-api -- curl -s -X POST "http://lo
 kubectl get pods -n centaur -l centaur-agent=true
 kubectl exec -n centaur <sandbox-pod> curl -s http://api:8000/health
 ```
+
+## Cursor Cloud specific instructions
+
+This section is for Cursor Cloud agents. The Cloud VM has **no Docker, Kubernetes,
+`just`, `kind`, `helm`, or 1Password**, so the Helm / `just up` / `kubectl` flow
+above does not apply here. The live code is Rust (`services/api-rs`), Bun/TS
+(`services/slackbotv2`, `packages/*`), and Python tools (`tools/`, `centaur_sdk`) —
+parts of this guide that describe a Python FastAPI control plane are historical.
+
+### Preinstalled in the VM snapshot (do not reinstall)
+- Rust stable via `rustup` (default toolchain; needed for edition 2024), `uv`, `bun`,
+  `pnpm`, and PostgreSQL 16 + ParadeDB **`pg_search` 0.23.0** (matches chart tag
+  `paradedb/paradedb:0.23.0-pg16`). `uv`/`bun` are on `PATH` via `~/.bashrc`.
+- The startup update script runs `pnpm install --frozen-lockfile` and `cargo fetch`.
+
+### Postgres (start it yourself — not auto-started)
+- No systemd in the VM. Start with `sudo pg_ctlcluster 16 main start`.
+- Connect as `postgres` / `postgres` on `127.0.0.1:5432`. Databases already created:
+  `centaur` (run the server here), `centaur_test` and `absurd_test` (cargo tests).
+- `pg_search` is preloaded via `/etc/postgresql/16/main/conf.d/pg_search.conf` and is
+  **required** by migration `0012` (`create extension pg_search` + a `bm25` index).
+  A vanilla Postgres without `pg_search` will fail migrations and the DB-backed tests.
+
+### Authoritative checks (mirror `.github/workflows/ci.yml`)
+- Rust, from `services/api-rs`: `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
+  The DB-backed tests **silently skip** unless you export both
+  `SESSION_RUNTIME_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/centaur_test`
+  and `ABSURD_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/absurd_test`.
+  The sandbox e2e tests are `#[ignore]`d (need a Kind cluster) and stay ignored.
+- Slackbot v2: `pnpm install --frozen-lockfile` (repo root) then `bun test test` in
+  `services/slackbotv2`.
+
+### Run the API + a real turn without K8s/secrets/LLM
+`centaur-api-server` defaults to `SESSION_SANDBOX_BACKEND=local` +
+`SESSION_SANDBOX_WORKLOAD=mock`, so it runs against only Postgres and a mock
+harness (replies `PONG`):
+
+```bash
+cd services/api-rs
+DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/centaur \
+RUN_MIGRATIONS=true BIND_ADDR=127.0.0.1:8080 WORKFLOW_HOST_SANDBOX=false \
+cargo run -p centaur-api-server      # GET /healthz -> {"ok":true}
+
+# in another shell — drives create-session -> message -> execute -> stream:
+CENTAUR_API_URL=http://127.0.0.1:8080 cargo run -p centaur-session-cli -- \
+  --harness-type codex --message "Reply with exactly PONG." \
+  --exit-on-terminal --max-duration-ms 30000
+```
+
+HTTP routes are `/api/session/{thread_key}` (the `thread_key` must be namespaced
+`<source>:<id>`, e.g. `cli:demo-1`), `.../messages`, `.../execute`, `.../events`
+— not the legacy `/agent/*` paths described earlier.
+
+### Not runnable in the Cloud VM as-is
+The full K8s sandbox path (real codex/claude/amp harness), Slack integration, and
+iron-proxy credential injection need Docker + a cluster + 1Password/Slack/LLM
+secrets, none of which exist here.
+
+### Python tools / SDK (not in CI)
+`ruff` lint is version-sensitive (run `uvx ruff check .` inside `tools/` or
+`centaur_sdk/`; latest ruff reports many pre-existing findings in `tools/`). SDK
+unit tests:
+`PYTHONPATH=<repo-root> uv run --with pytest --with pytest-asyncio python -m pytest centaur_sdk/tests -o asyncio_mode=auto`.
+Note: the Cloud VM injects real tool API keys (e.g. `OPENAI_API_KEY`,
+`ALCHEMY_API_KEY`) into the environment, which makes a couple of env-backed
+`StubBackend`/registry placeholder unit tests fail; `env -u OPENAI_API_KEY -u ALCHEMY_API_KEY ...`
+to run those cleanly.
