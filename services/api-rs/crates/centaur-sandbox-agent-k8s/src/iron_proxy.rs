@@ -1583,8 +1583,14 @@ mod tests {
             port: 8000,
         };
 
-        let policies =
-            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, Some(&target), &[]);
+        let policies = build_iron_proxy_network_policies(
+            &id,
+            &resolved(),
+            &iron_proxy,
+            3000,
+            Some(&target),
+            &[],
+        );
         let sandbox_egress = policies[0]
             .spec
             .as_ref()
@@ -1599,7 +1605,8 @@ mod tests {
                 .any(|rule| rule_allows_namespace_port(rule, "laminar", 8000))
         );
 
-        let policies = build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None, &[]);
+        let policies =
+            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None, &[]);
         let sandbox_egress = policies[0]
             .spec
             .as_ref()
@@ -1620,7 +1627,8 @@ mod tests {
         let id = SandboxId::new("asbx-test");
         let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
 
-        let policies = build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None, &[]);
+        let policies =
+            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None, &[]);
         let ingress = policies[1]
             .spec
             .as_ref()
@@ -1880,14 +1888,8 @@ mod tests {
         let id = SandboxId::new("asbx-test");
         let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
 
-        let policies = build_iron_proxy_network_policies(
-            &id,
-            &resolved(),
-            &iron_proxy,
-            3000,
-            None,
-            &[8000],
-        );
+        let policies =
+            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None, &[8000]);
         let sandbox_egress = policies[0]
             .spec
             .as_ref()
@@ -1896,16 +1898,14 @@ mod tests {
             .as_ref()
             .unwrap()
             .clone();
-        assert!(
-            sandbox_egress.iter().any(|rule| {
-                rule.to.is_none()
-                    && rule.ports.as_ref().is_some_and(|ports| {
-                        ports.iter().any(|policy_port| {
-                            policy_port.port == Some(IntOrString::Int(8000))
-                        })
-                    })
-            })
-        );
+        assert!(sandbox_egress.iter().any(|rule| {
+            rule.to.is_none()
+                && rule.ports.as_ref().is_some_and(|ports| {
+                    ports
+                        .iter()
+                        .any(|policy_port| policy_port.port == Some(IntOrString::Int(8000)))
+                })
+        }));
     }
 
     #[test]

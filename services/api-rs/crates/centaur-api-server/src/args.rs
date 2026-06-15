@@ -2314,7 +2314,10 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(args.sandbox.sandbox_host_egress_ports().unwrap(), vec![8000]);
+        assert_eq!(
+            args.sandbox.sandbox_host_egress_ports().unwrap(),
+            vec![8000]
+        );
     }
 
     #[test]
@@ -2330,7 +2333,10 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(args.sandbox.sandbox_host_egress_ports().unwrap(), Vec::<u16>::new());
+        assert_eq!(
+            args.sandbox.sandbox_host_egress_ports().unwrap(),
+            Vec::<u16>::new()
+        );
     }
 
     #[test]
@@ -2346,7 +2352,10 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(args.sandbox.sandbox_host_egress_ports().unwrap(), Vec::<u16>::new());
+        assert_eq!(
+            args.sandbox.sandbox_host_egress_ports().unwrap(),
+            Vec::<u16>::new()
+        );
     }
 
     #[test]
@@ -2362,7 +2371,10 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(args.sandbox.sandbox_host_egress_ports().unwrap(), Vec::<u16>::new());
+        assert_eq!(
+            args.sandbox.sandbox_host_egress_ports().unwrap(),
+            Vec::<u16>::new()
+        );
     }
 
     #[test]
