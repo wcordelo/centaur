@@ -22,4 +22,6 @@ exec "${VENV}/bin/vllm-mlx" serve "${MODEL}" \
   --served-model-name "${SERVED_NAME}" \
   --host 0.0.0.0 --port "${PORT}" \
   --continuous-batching \
-  --enable-auto-tool-choice --tool-call-parser gemma4
+  --enable-auto-tool-choice \
+  --tool-call-parser gemma4 \
+  --reasoning-parser gemma4
