@@ -24,6 +24,11 @@ export interface QuickSiteRef {
 /** DNS label: 1-63 chars, lowercase alphanumerics, internal hyphens. */
 const SITE_ID = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
 
+/** Slack Block Kit caps messages at 50 blocks; each Quick site uses section + actions. */
+const SLACK_BLOCK_LIMIT = 50
+const BLOCKS_PER_QUICK_SITE = 2
+export const MAX_QUICK_CARD_SITES = Math.floor(SLACK_BLOCK_LIMIT / BLOCKS_PER_QUICK_SITE)
+
 /** The chat-SDK action id a Quick button click is routed to. */
 export function quickActionId(kind: QuickActionKind): string {
   return `${QUICK_ACTION_PREFIX}${kind}`
@@ -50,8 +55,13 @@ export function findQuickSiteUrls(text: string, baseDomain: string): QuickSiteRe
  * button's `value` so the action handler knows which site to act on.
  */
 export function buildQuickDeployCard(text: string, baseDomain: string): CardElement | null {
+  const refs = findQuickSiteUrls(text, baseDomain)
+  if (refs.length === 0) return null
+
+  const shown = refs.slice(0, MAX_QUICK_CARD_SITES)
+  const omitted = refs.length - shown.length
   const children: CardChild[] = []
-  for (const ref of findQuickSiteUrls(text, baseDomain)) {
+  for (const ref of shown) {
     const value = JSON.stringify(ref)
     children.push(
       {
@@ -68,6 +78,14 @@ export function buildQuickDeployCard(text: string, baseDomain: string): CardElem
       }
     )
   }
-  if (children.length === 0) return null
+  if (omitted > 0) {
+    children.push({
+      type: 'section',
+      children: [{
+        type: 'text',
+        content: `_…and ${omitted} more Quick site${omitted === 1 ? '' : 's'} not shown (Slack block limit)._`
+      }]
+    })
+  }
   return { type: 'card', children }
 }

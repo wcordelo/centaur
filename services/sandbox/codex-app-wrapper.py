@@ -1053,6 +1053,66 @@ def export_slack_thread_env(thread_key: str) -> None:
         os.environ["SLACK_THREAD_TS"] = thread_ts
 
 
+def _trace_metadata_sources(trace_metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    if trace_metadata:
+        sources.append(trace_metadata)
+    nested = trace_metadata.get("metadata")
+    if isinstance(nested, dict):
+        sources.append(nested)
+    return sources
+
+
+def requester_identity_from_trace_metadata(
+    trace_metadata: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Extract the acting Slack user from harness ``trace_metadata``.
+
+    slackbotv2 puts requester fields at the top level; session-runtime steering
+    lines nest the session message metadata under ``metadata``.
+    """
+    slack_user_id: str | None = None
+    slack_user_name: str | None = None
+    for source in _trace_metadata_sources(trace_metadata):
+        if not slack_user_id:
+            raw_id = source.get("slack_user_id") or source.get("user_id")
+            if isinstance(raw_id, str):
+                candidate = raw_id.strip()
+                if candidate:
+                    slack_user_id = candidate
+        if not slack_user_name:
+            raw_name = (
+                source.get("slack_user_name")
+                or source.get("user_name")
+                or source.get("slack_display_name")
+            )
+            if isinstance(raw_name, str):
+                candidate = raw_name.strip()
+                if candidate:
+                    slack_user_name = candidate
+    return slack_user_id, slack_user_name
+
+
+def export_requester_env(trace_metadata: dict[str, Any]) -> None:
+    """Publish per-turn requester identity for Centaur tools.
+
+    Quick ownership keys off ``QUICK_REQUESTER``; Slack tools use
+    ``SLACK_REQUESTER_ID`` / ``SLACK_REQUESTER_NAME``. Clears stale values when
+    the current turn has no requester so a prior Slack user cannot leak across
+    turns.
+    """
+    slack_user_id, slack_user_name = requester_identity_from_trace_metadata(
+        trace_metadata
+    )
+    for name in ("QUICK_REQUESTER", "SLACK_REQUESTER_ID", "SLACK_REQUESTER_NAME"):
+        os.environ.pop(name, None)
+    if slack_user_id:
+        os.environ["QUICK_REQUESTER"] = slack_user_id
+        os.environ["SLACK_REQUESTER_ID"] = slack_user_id
+    if slack_user_name:
+        os.environ["SLACK_REQUESTER_NAME"] = slack_user_name
+
+
 def handle_input(turn_input: dict[str, Any]) -> None:
     global ACTIVE_TURN_ID, CURRENT_LLM_INPUT_TEXT, CURRENT_LLM_OUTPUT_TEXT
     global CURRENT_TRACE_METADATA
@@ -1070,6 +1130,7 @@ def handle_input(turn_input: dict[str, Any]) -> None:
     if thread_key:
         os.environ["CENTAUR_THREAD_KEY"] = thread_key
         export_slack_thread_env(thread_key)
+    export_requester_env(trace_metadata_from_input(turn_input))
     configure_trace_context_for_startup(turn_input.get("trace_id"))
     configure_traceparent(turn_input.get("traceparent"))
     configure_codex_otel_for_startup(

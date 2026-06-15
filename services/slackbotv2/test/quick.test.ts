@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'bun:test'
 import type { ButtonElement, CardElement } from 'chat'
-import { buildQuickDeployCard, findQuickSiteUrls, quickActionId } from '../src/quick-card'
+import {
+  buildQuickDeployCard,
+  findQuickSiteUrls,
+  MAX_QUICK_CARD_SITES,
+  quickActionId
+} from '../src/quick-card'
 import { parseQuickAction, parseQuickActionKind, quickActionPrompt } from '../src/quick-actions'
 
 const DOMAIN = 'quick.internal'
@@ -62,6 +67,24 @@ describe('buildQuickDeployCard', () => {
 
   it('returns null when no quick url is present', () => {
     expect(buildQuickDeployCard('all done, no site here', DOMAIN)).toBeNull()
+  })
+
+  it('caps sites at the Slack block limit and notes omissions', () => {
+    const sites = Array.from(
+      { length: MAX_QUICK_CARD_SITES + 3 },
+      (_, index) => `https://site-${index}.${DOMAIN}`
+    )
+    const card = buildQuickDeployCard(sites.join(' '), DOMAIN)
+    expect(card).not.toBeNull()
+    const children = (card as CardElement).children
+    expect(children).toHaveLength(MAX_QUICK_CARD_SITES * 2 + 1)
+    const last = children[children.length - 1]
+    expect(last?.type).toBe('section')
+    if (last?.type !== 'section') throw new Error('expected trailing section')
+    const text = last.children[0]
+    expect(text?.type).toBe('text')
+    if (text?.type !== 'text') throw new Error('expected text child')
+    expect(text.content).toContain('3 more Quick sites')
   })
 })
 
