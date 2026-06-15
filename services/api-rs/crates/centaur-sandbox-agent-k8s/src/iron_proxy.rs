@@ -1361,12 +1361,12 @@ fn split_authority_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
             .and_then(|port_str| port_str.parse().ok());
         return Some((host, port));
     }
-    if let Some((host, port_str)) = authority.rsplit_once(':') {
-        if !host.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(port) = port_str.parse() {
-                return Some((host, Some(port)));
-            }
-        }
+    if let Some((host, port_str)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && port_str.chars().all(|c| c.is_ascii_digit())
+        && let Ok(port) = port_str.parse()
+    {
+        return Some((host, Some(port)));
     }
     Some((authority, None))
 }
@@ -2026,9 +2026,7 @@ mod tests {
                 .map(|env| env.value.clone())
                 .unwrap();
             assert!(
-                value
-                    .split(',')
-                    .any(|host| host == "host.docker.internal"),
+                value.split(',').any(|host| host == "host.docker.internal"),
                 "{name} should contain the vLLM host: {value}"
             );
         }
@@ -2049,9 +2047,7 @@ mod tests {
             .map(|env| env.value.clone())
             .unwrap();
         assert!(
-            !value
-                .split(',')
-                .any(|host| host == "vllm.prod.example.com"),
+            !value.split(',').any(|host| host == "vllm.prod.example.com"),
             "non-allowlisted vLLM host must not be added to NO_PROXY: {value}"
         );
     }

@@ -865,10 +865,7 @@ impl SandboxArgs {
                     clean_optional_value(self.quick_sites_pvc.as_deref()),
                     clean_optional_value(self.quick_local_root.as_deref()),
                 ) {
-                    workload = workload.mount(Mount::new(
-                        MountKind::NamedVolume(pvc),
-                        root,
-                    ));
+                    workload = workload.mount(Mount::new(MountKind::NamedVolume(pvc), root));
                 }
                 Ok(workload)
             }
@@ -1779,12 +1776,12 @@ fn split_authority_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
             .and_then(|port_str| port_str.parse().ok());
         return Some((host, port));
     }
-    if let Some((host, port_str)) = authority.rsplit_once(':') {
-        if !host.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(port) = port_str.parse() {
-                return Some((host, Some(port)));
-            }
-        }
+    if let Some((host, port_str)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && port_str.chars().all(|c| c.is_ascii_digit())
+        && let Ok(port) = port_str.parse()
+    {
+        return Some((host, Some(port)));
     }
     Some((authority, None))
 }
@@ -1872,7 +1869,9 @@ fn upsert_spec_env(spec: &mut SandboxSpec, name: String, value: String) {
 }
 
 fn upsert_env_pair(envs: &mut Vec<(String, String)>, name: &str, value: String) {
-    if let Some((_, existing_value)) = envs.iter_mut().find(|(existing_name, _)| existing_name == name)
+    if let Some((_, existing_value)) = envs
+        .iter_mut()
+        .find(|(existing_name, _)| existing_name == name)
     {
         *existing_value = value;
     } else {
@@ -2486,10 +2485,7 @@ mod tests {
             parse_vllm_host_egress_port("http://host.docker.internal/v1"),
             Some(8000)
         );
-        assert_eq!(
-            parse_vllm_host_egress_port("http://[::1]/v1"),
-            Some(8000)
-        );
+        assert_eq!(parse_vllm_host_egress_port("http://[::1]/v1"), Some(8000));
         assert_eq!(
             parse_vllm_host_egress_port("http://[::1]:8000/v1"),
             Some(8000)
