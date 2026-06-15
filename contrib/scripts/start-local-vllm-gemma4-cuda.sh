@@ -30,6 +30,7 @@ ARGS=(
   --enable-auto-tool-choice
   --tool-call-parser gemma4
   --reasoning-parser gemma4
+  --override-generation-config '{"eos_token_id":[1,106,50]}'
 )
 
 if [[ -n "${CHAT_TEMPLATE}" ]]; then

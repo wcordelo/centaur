@@ -105,6 +105,7 @@ vllm serve google/gemma-4-E4B-it \
   --enable-auto-tool-choice \
   --tool-call-parser gemma4 \
   --reasoning-parser gemma4 \
+  --override-generation-config '{"eos_token_id":[1,106,50]}' \
   --chat-template examples/tool_chat_template_gemma4.jinja
 ```
 
@@ -143,6 +144,14 @@ When testing or building a thin proxy in front of vLLM:
   "stop_token_ids": [106]
 }
 ```
+
+The CUDA launcher (`contrib/scripts/start-local-vllm-gemma4-cuda.sh`) also sets server-side EOS handling:
+
+```bash
+--override-generation-config '{"eos_token_id":[1,106,50]}'
+```
+
+This covers base `<eos>` (1), chat end-of-turn `<turn|>` (106), and the Gemma 4 stop id 50 so tool-call turns terminate instead of running to `max_tokens`.
 
 vLLM merges `<|tool_response|>` into stops when `--tool-call-parser gemma4` is active (required after tool results). On vllm-mlx, ensure you are on a build that includes the `<|tool_response>` stop fix (see [vllm-mlx#383](https://github.com/waybarrios/vllm-mlx/pull/383)).
 
