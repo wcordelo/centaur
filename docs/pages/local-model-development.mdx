@@ -82,13 +82,13 @@ Rebuild the agent image with the Codex harness, redeploy, and start a **new** Sl
 
 ## Gemma 4 on vLLM — required server flags
 
-Gemma 4 uses a **custom tool-call protocol** (`<|tool_call>`, `<tool_call|>`, `<|channel>thought`, …). Generic OpenAI chat serving is not enough; enable the Gemma 4 parsers:
+Gemma 4 uses a **custom tool-call protocol** (`&lt;|tool_call&gt;`, `&lt;tool_call|&gt;`, `&lt;|channel&gt;thought`, …). Generic OpenAI chat serving is not enough; enable the Gemma 4 parsers:
 
 | Flag | When required |
 | --- | --- |
 | `--enable-auto-tool-choice` | Tool / function calling (Codex agent turns) |
 | `--tool-call-parser gemma4` | Parse Gemma 4 tool syntax into OpenAI `tool_calls` |
-| `--reasoning-parser gemma4` | Expose thinking in `reasoning` / strip `\<|channel\>…<channel|>` |
+| `--reasoning-parser gemma4` | Expose thinking in `reasoning` / strip `\&lt;|channel\&gt;…&lt;channel|&gt;` |
 | `--chat-template examples/tool_chat_template_gemma4.jinja` | Recommended on upstream CUDA vLLM (bundled in official images) |
 
 The Centaur CUDA helper script sets all of these. The Apple Silicon `vllm-mlx` script sets the same parser flags when your vllm-mlx build supports them (see [vllm-mlx#380](https://github.com/waybarrios/vllm-mlx/issues/380)).
@@ -113,14 +113,14 @@ For Apple Silicon, `contrib/scripts/start-local-vllm-gemma4.sh` wraps the equiva
 
 ## Stop tokens and EOS workarounds
 
-Gemma 4 chat models end turns with **`<turn|>`** (tokenizer id **106**), not the base model `<eos>` (id 1). Several failure modes show up in agentic / tool-call mode when stop handling is wrong.
+Gemma 4 chat models end turns with **`&lt;turn|&gt;`** (tokenizer id **106**), not the base model `&lt;eos&gt;` (id 1). Several failure modes show up in agentic / tool-call mode when stop handling is wrong.
 
 ### Symptoms
 
 | Symptom | Likely cause |
 | --- | --- |
-| Generation runs until `max_tokens` with trailing `<turn|><turn|>` soup | `tokenizer_config.json` has wrong `eos_token` (merged checkpoints often reset to `<eos>`) |
-| Raw `<|channel>`, `<|tool_call>`, `<tool_call|>` in user-visible text | Missing `--reasoning-parser gemma4` / `--tool-call-parser gemma4`, or streaming parser bugs on old vLLM |
+| Generation runs until `max_tokens` with trailing `&lt;turn|&gt;&lt;turn|&gt;` soup | `tokenizer_config.json` has wrong `eos_token` (merged checkpoints often reset to `&lt;eos&gt;`) |
+| Raw `&lt;|channel&gt;`, `&lt;|tool_call&gt;`, `&lt;tool_call|&gt;` in user-visible text | Missing `--reasoning-parser gemma4` / `--tool-call-parser gemma4`, or streaming parser bugs on old vLLM |
 | Tool args like `{"search_all": "trutrue"}` in streaming mode | Known gemma4 tool-parser streaming bug — prefer non-streaming smoke tests or upgrade vLLM |
 | Infinite JSON repetition under `response_format: json_schema` | Grammar whitespace loops — use `disable_any_whitespace=true` (xgrammar backend) |
 
@@ -131,7 +131,7 @@ Gemma 4 chat models end turns with **`<turn|>`** (tokenizer id **106**), not the
 For fine-tuned or merged weights, confirm `tokenizer_config.json` has:
 
 ```json
-"eos_token": "<turn|>"
+"eos_token": "&lt;turn|&gt;"
 ```
 
 **2. Pass explicit stop tokens in API requests**
@@ -140,7 +140,7 @@ When testing or building a thin proxy in front of vLLM:
 
 ```json
 {
-  "stop": ["<turn|>", "<|tool_response|>"],
+  "stop": ["&lt;turn|&gt;", "&lt;|tool_response|&gt;"],
   "stop_token_ids": [106]
 }
 ```
@@ -151,9 +151,9 @@ The CUDA launcher (`contrib/scripts/start-local-vllm-gemma4-cuda.sh`) also sets 
 --override-generation-config '{"eos_token_id":[1,106,50]}'
 ```
 
-This covers base `<eos>` (1), chat end-of-turn `<turn|>` (106), and the Gemma 4 stop id 50 so tool-call turns terminate instead of running to `max_tokens`.
+This covers base `&lt;eos&gt;` (1), chat end-of-turn `&lt;turn|&gt;` (106), and the Gemma 4 stop id 50 so tool-call turns terminate instead of running to `max_tokens`.
 
-vLLM merges `<|tool_response|>` into stops when `--tool-call-parser gemma4` is active (required after tool results). On vllm-mlx, ensure you are on a build that includes the `<|tool_response>` stop fix (see [vllm-mlx#383](https://github.com/waybarrios/vllm-mlx/pull/383)).
+vLLM merges `&lt;|tool_response|&gt;` into stops when `--tool-call-parser gemma4` is active (required after tool results). On vllm-mlx, ensure you are on a build that includes the `&lt;|tool_response&gt;` stop fix (see [vllm-mlx#383](https://github.com/waybarrios/vllm-mlx/pull/383)).
 
 **3. Enable reasoning + tool parsers**
 
@@ -161,7 +161,7 @@ Without `--reasoning-parser gemma4`, thinking delimiters leak into `content`. Ce
 
 **4. Strip channel tokens in clients (last resort)**
 
-If you cannot upgrade vLLM yet, post-process assistant `content` to remove patterns like `<|channel>…<channel|>`. Prefer fixing server-side parsers instead.
+If you cannot upgrade vLLM yet, post-process assistant `content` to remove patterns like `&lt;|channel&gt;…&lt;channel|&gt;`. Prefer fixing server-side parsers instead.
 
 **5. Codex + E2B caveat**
 
@@ -239,7 +239,7 @@ Enable thinking per request:
 }
 ```
 
-With `--reasoning-parser gemma4`, the API exposes thinking in `message.reasoning` (OpenAI SDK) instead of leaking `<|channel>thought\n…<channel|>` into `content`. The test script checks for delimiter leaks when thinking is on.
+With `--reasoning-parser gemma4`, the API exposes thinking in `message.reasoning` (OpenAI SDK) instead of leaking `&lt;|channel&gt;thought\n…&lt;channel|&gt;` into `content`. The test script checks for delimiter leaks when thinking is on.
 
 Default all requests to thinking:
 
@@ -288,7 +288,7 @@ When `CODEX_USE_VLLM=1` and the base URL is allowlisted, api-rs opens a **port-s
 | Models list | `curl -s http://127.0.0.1:8000/v1/models \| jq .` |
 | Full smoke suite | `python3 contrib/scripts/test-local-vllm-gemma4.py` |
 | From kind pod | `kubectl run -n centaur curl-test --rm -it --restart=Never --image=curlimages/curl -- curl -sS http://host.docker.internal:8000/v1/models` |
-| Sandbox env | `kubectl exec -n centaur <asbx-pod> -- printenv \| grep -E 'VLLM|CODEX_USE'` |
+| Sandbox env | `kubectl exec -n centaur &lt;asbx-pod&gt; -- printenv \| grep -E 'VLLM|CODEX_USE'` |
 
 | Problem | Fix |
 | --- | --- |
