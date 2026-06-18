@@ -1,0 +1,5 @@
+centaur-eve-demo/node_modules/
+centaur-eve-demo/.eve/
+centaur-eve-demo/.vercel/
+centaur-eve-demo/.output/
+artifacts/
