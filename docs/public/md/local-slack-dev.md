@@ -154,6 +154,8 @@ kubectl logs -n centaur deploy/centaur-centaur-slackbotv2 -f
 
 ## Optional: local LLM with vLLM (experimental)
 
+> **Full guide:** [Local model development with vLLM and Gemma 4](../../local-model-development.md) — tool-call-parser, reasoning/EOS workarounds, JSON schema, config templates, and `contrib/scripts/test-local-vllm-gemma4.py`.
+
 > **Status:** Gemma 4 **E2B** checkpoints emit Codex `<|channel>` control tokens through vLLM; Slack replies are garbled (bullets, token soup) until we add response stripping or use a non-E2B model. Use **OpenAI** for reliable local Slack dev.
 
 To try vLLM anyway, uncomment the `sandbox.extraEnv` block in `values.local-slack.example.yaml` and start a vLLM server on your Mac. Sandboxes use Codex’s [vLLM provider](https://docs.vllm.ai/en/stable/serving/integrations/codex/) (`wire_api = "responses"`).
@@ -189,6 +191,9 @@ Quick check from your Mac:
 
 ```bash
 curl -s http://127.0.0.1:8000/v1/models | jq .
+
+# Or run the full tool / reasoning / JSON-schema probe:
+contrib/scripts/test-local-vllm-gemma4.py
 ```
 
 ### 2. Build the agent image (codex harness + vLLM config)
