@@ -7,6 +7,7 @@ export const sidebar = [
       { text: 'What is Centaur?', link: '/what-is-centaur' },
       { text: 'Quickstart', link: '/quickstart' },
       { text: 'Mac Mini-style setup', link: '/mac-mini-setup' },
+      { text: 'Local model development (vLLM + Gemma 4)', link: '/local-model-development' },
       { text: 'Deploying in Production', link: '/deploying-in-production' },
       { text: 'Architecture', link: '/architecture' },
     ],
