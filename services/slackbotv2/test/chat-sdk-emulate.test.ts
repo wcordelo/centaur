@@ -10,6 +10,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test'
 import { WebClient } from '@slack/web-api'
 import { createEmulator, type Emulator } from 'emulate'
 import { createMemoryState } from '@chat-adapter/state-memory'
+import type { StateAdapter } from 'chat'
 import type { ServerNotification } from '@centaur/harness-events'
 import {
   createSlackbotV2,
@@ -33,6 +34,8 @@ const TEAM_ID = 'T000000001'
 const CHANNEL_ID = 'C000000001'
 /** How real Slack renders a streamed message whose stream broke or was never stopped. */
 const BROKEN_STREAM_TEXT = ':warning: Something went wrong'
+const RENDER_OBLIGATION_INDEX_KEY = 'slackbotv2:render:index'
+const RENDER_RECOVERY_WAIT_MS = 5000
 
 let emulator: Emulator
 let slackApi: PatchedSlackApi
@@ -1515,7 +1518,7 @@ describe('slackbotv2', () => {
     // The crashed render consumed the whole stream (lastEventId advanced past
     // the terminal event) but the answer never reached Slack. Recovery must
     // replay from the obligation's starting position, not lastEventId.
-    await sharedState.set(`thread-state:${key}`, {
+    await seedRenderRecoveryState(sharedState, key, {
       activeExecution: true,
       executedMessageIds: [mention.ts],
       forwardedMessageIds: [mention.ts],
@@ -1527,20 +1530,19 @@ describe('slackbotv2', () => {
         message
       }
     })
-    await sharedState.appendToList('slackbotv2:render:index', key)
     codexApi.emitOutputLines(key, sampleCodexOutputLines('Recovered consumed answer.'))
 
     bot = createTestBot({ state: sharedState })
 
-    await waitFor(() => codexApi.eventRequests.length === 1, 2000)
-    await waitFor(() => slackApi.calls.some(call => call.method === 'chat.stopStream'), 2000)
+    await waitFor(() => codexApi.eventRequests.length === 1, RENDER_RECOVERY_WAIT_MS)
+    await waitFor(() => slackApi.calls.some(call => call.method === 'chat.stopStream'), RENDER_RECOVERY_WAIT_MS)
 
     expect(codexApi.eventRequests).toEqual([
       { afterEventId: 0, executionId: 'exe-recovery-consumed', threadKey: key }
     ])
     expect(await threadText(parent.ts)).toContain('Recovered consumed answer.')
     const recoveredThreadState = await sharedState.get<Record<string, unknown>>(
-      `thread-state:${key}`
+      threadStateKey(key)
     )
     expect(recoveredThreadState).toEqual(
       expect.objectContaining({
@@ -2226,7 +2228,7 @@ describe('slackbotv2', () => {
       threadId: key,
       ts: mention.ts
     })
-    await sharedState.set(`thread-state:${key}`, {
+    await seedRenderRecoveryState(sharedState, key, {
       activeExecution: true,
       executedMessageIds: [mention.ts],
       forwardedMessageIds: [mention.ts],
@@ -2238,13 +2240,12 @@ describe('slackbotv2', () => {
         message
       }
     })
-    await sharedState.appendToList('slackbotv2:render:index', key)
     codexApi.emitOutputLines(key, sampleCodexOutputLines('Recovered request.'))
 
     bot = createTestBot({ state: sharedState })
 
-    await waitFor(() => codexApi.eventRequests.length === 1, 2000)
-    await waitFor(() => slackApi.calls.some(call => call.method === 'chat.stopStream'), 2000)
+    await waitFor(() => codexApi.eventRequests.length === 1, RENDER_RECOVERY_WAIT_MS)
+    await waitFor(() => slackApi.calls.some(call => call.method === 'chat.stopStream'), RENDER_RECOVERY_WAIT_MS)
 
     expect(codexApi.creates).toHaveLength(0)
     expect(codexApi.appends).toHaveLength(0)
@@ -2258,7 +2259,7 @@ describe('slackbotv2', () => {
     })
     expect(await threadText(parent.ts)).toContain('Recovered request.')
     const recoveredThreadState = await sharedState.get<Record<string, unknown>>(
-      `thread-state:${key}`
+      threadStateKey(key)
     )
     expect(recoveredThreadState).toEqual(
       expect.objectContaining({
@@ -2284,7 +2285,7 @@ describe('slackbotv2', () => {
       threadId: hungKey,
       ts: '1781100000.000002'
     })
-    await sharedState.set(`thread-state:${hungKey}`, {
+    await seedRenderRecoveryState(sharedState, hungKey, {
       activeExecution: true,
       executedMessageIds: [hungMessage.id],
       forwardedMessageIds: [hungMessage.id],
@@ -2296,7 +2297,6 @@ describe('slackbotv2', () => {
         message: hungMessage
       }
     })
-    await sharedState.appendToList('slackbotv2:render:index', hungKey)
 
     const parent = await postUserMessage('Context before queued recovery.')
     const mentionText = `<@${BOT_USER_ID}> recover behind a zombie`
@@ -2308,7 +2308,7 @@ describe('slackbotv2', () => {
       threadId: key,
       ts: mention.ts
     })
-    await sharedState.set(`thread-state:${key}`, {
+    await seedRenderRecoveryState(sharedState, key, {
       activeExecution: true,
       executedMessageIds: [mention.ts],
       forwardedMessageIds: [mention.ts],
@@ -2320,22 +2320,21 @@ describe('slackbotv2', () => {
         message
       }
     })
-    await sharedState.appendToList('slackbotv2:render:index', key)
     codexApi.emitOutputLines(key, sampleCodexOutputLines('Recovered behind the zombie.'))
 
     bot = createTestBot({ state: sharedState, renderRecoveryThreadTimeoutMs: 200 })
 
     await waitFor(async () => {
-      const recovered = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      const recovered = await sharedState.get<Record<string, unknown>>(threadStateKey(key))
       return recovered?.renderObligation === null
-    }, 5000)
+    }, RENDER_RECOVERY_WAIT_MS)
     expect(await threadText(parent.ts)).toContain('Recovered behind the zombie.')
-    const recoveredState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+    const recoveredState = await sharedState.get<Record<string, unknown>>(threadStateKey(key))
     expect(recoveredState).toEqual(
       expect.objectContaining({ activeExecution: false, renderObligation: null })
     )
     // The hung thread stays pending (deferred), not failed or cleared.
-    const hungState = await sharedState.get<Record<string, unknown>>(`thread-state:${hungKey}`)
+    const hungState = await sharedState.get<Record<string, unknown>>(threadStateKey(hungKey))
     expect(hungState).toEqual(
       expect.objectContaining({
         renderObligation: expect.objectContaining({ executionId: 'exe-hung-recovery' })
@@ -2359,7 +2358,7 @@ describe('slackbotv2', () => {
       threadId: zombieKey,
       ts: '1781200000.000002'
     })
-    await sharedState.set(`thread-state:${zombieKey}`, {
+    await seedRenderRecoveryState(sharedState, zombieKey, {
       activeExecution: true,
       executedMessageIds: [zombieMessage.id],
       forwardedMessageIds: [zombieMessage.id],
@@ -2371,7 +2370,6 @@ describe('slackbotv2', () => {
         message: zombieMessage
       }
     })
-    await sharedState.appendToList('slackbotv2:render:index', zombieKey)
 
     codexApi.autoRespond = false
     bot = createTestBot({ state: sharedState, renderRecoveryThreadTimeoutMs: 100 })
@@ -2400,7 +2398,7 @@ describe('slackbotv2', () => {
     expect(response.status).toBe(200)
 
     const key = threadKey(parent.ts)
-    await waitFor(() => codexApi.executes.length === 1, 2000)
+    await waitFor(() => codexApi.executes.length === 1, RENDER_RECOVERY_WAIT_MS)
     const outputLines = sampleCodexOutputLines('Single answer despite the sweep.')
     // Everything except turn/completed: the live render stays in-flight...
     codexApi.emitOutputLines(key, outputLines.slice(0, -1))
@@ -2410,9 +2408,9 @@ describe('slackbotv2', () => {
     await Promise.all(waits)
     await waitFor(() => slackApi.calls.some(call => call.method === 'chat.stopStream'), 3000)
     await waitFor(async () => {
-      const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      const threadState = await sharedState.get<Record<string, unknown>>(threadStateKey(key))
       return threadState?.renderObligation === null
-    }, 3000)
+    }, RENDER_RECOVERY_WAIT_MS)
 
     // Exactly one renderer consumed the execution and exactly one Slack
     // stream was started for the live thread.
@@ -2438,7 +2436,7 @@ describe('slackbotv2', () => {
       threadId: corruptKey,
       ts: '1781100001.000001'
     })
-    await sharedState.set(`thread-state:${corruptKey}`, {
+    await seedRenderRecoveryState(sharedState, corruptKey, {
       activeExecution: true,
       executedMessageIds: [corruptMessage.id],
       forwardedMessageIds: [corruptMessage.id],
@@ -2450,19 +2448,18 @@ describe('slackbotv2', () => {
         message: corruptMessage
       }
     })
-    await sharedState.appendToList('slackbotv2:render:index', corruptKey)
     codexApi.emitOutputLines(corruptKey, sampleCodexOutputLines('Unreachable answer.'))
 
     bot = createTestBot({ state: sharedState })
 
     await waitFor(async () => {
       const threadState = await sharedState.get<Record<string, unknown>>(
-        `thread-state:${corruptKey}`
+        threadStateKey(corruptKey)
       )
       return threadState?.renderObligation === null
     }, 10_000)
     const abandonedState = await sharedState.get<Record<string, unknown>>(
-      `thread-state:${corruptKey}`
+      threadStateKey(corruptKey)
     )
     expect(abandonedState).toEqual(
       expect.objectContaining({ activeExecution: false, renderObligation: null })
@@ -2528,7 +2525,7 @@ describe('slackbotv2', () => {
     ])
     expect(await threadText(parent.ts)).toContain('Recovered after stream retry.')
     const recoveredThreadState = await sharedState.get<Record<string, unknown>>(
-      `thread-state:${key}`
+      threadStateKey(key)
     )
     expect(recoveredThreadState).toEqual(
       expect.objectContaining({
@@ -2976,6 +2973,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function threadKey(threadTs: string): string {
   return `slack:${CHANNEL_ID}:${threadTs}`
+}
+
+function threadStateKey(threadId: string): string {
+  return `thread-state:${threadId}`
+}
+
+async function seedRenderRecoveryState(
+  sharedState: StateAdapter,
+  threadId: string,
+  state: Record<string, unknown>
+): Promise<void> {
+  const stateKey = threadStateKey(threadId)
+  await sharedState.set(stateKey, state)
+  await sharedState.appendToList(RENDER_OBLIGATION_INDEX_KEY, threadId)
+  await waitFor(async () => {
+    const stored = await sharedState.get<Record<string, unknown>>(stateKey)
+    if (!stored?.renderObligation) return false
+    const indexed = await sharedState.getList<string>(RENDER_OBLIGATION_INDEX_KEY)
+    return indexed.includes(threadId)
+  })
 }
 
 function apiMessageFromSlackEvent(input: {
