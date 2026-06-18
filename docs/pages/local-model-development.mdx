@@ -88,7 +88,7 @@ Gemma 4 uses a **custom tool-call protocol** (`<|tool_call>`, `<tool_call|>`, `<
 | --- | --- |
 | `--enable-auto-tool-choice` | Tool / function calling (Codex agent turns) |
 | `--tool-call-parser gemma4` | Parse Gemma 4 tool syntax into OpenAI `tool_calls` |
-| `--reasoning-parser gemma4` | Expose thinking in `reasoning` / strip `<|channel>…<channel|>` |
+| `--reasoning-parser gemma4` | Expose thinking in `reasoning` / strip `\<|channel\>…<channel|>` |
 | `--chat-template examples/tool_chat_template_gemma4.jinja` | Recommended on upstream CUDA vLLM (bundled in official images) |
 
 The Centaur CUDA helper script sets all of these. The Apple Silicon `vllm-mlx` script sets the same parser flags when your vllm-mlx build supports them (see [vllm-mlx#380](https://github.com/waybarrios/vllm-mlx/issues/380)).
