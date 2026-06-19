@@ -1,0 +1,16 @@
+{
+  "name": "@centaur/world-cup-watchdog",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Backup/verification loop that polls live World Cup matches and alerts when the main webhook trigger goes silent.",
+  "scripts": {
+    "start": "node --experimental-strip-types cli.ts",
+    "test": "node --experimental-strip-types --test watchdog.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "typescript": "5.9.3"
+  }
+}
