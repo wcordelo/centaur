@@ -207,6 +207,7 @@ fn run_codex_user_turn<W: Write>(
     reasoning: Option<String>,
 ) -> Result<()> {
     let (model, model_provider) = model_and_provider;
+    let mut turn_model = model;
     if thread_id.is_none() {
         *thread_id = Some(start_or_resume_thread(
             codex,
@@ -215,20 +216,22 @@ fn run_codex_user_turn<W: Write>(
             &model_provider,
         )?);
         *thread_provider = Some(model_provider.clone());
-    } else if let (Some(requested), Some(pinned)) =
-        (requested_provider.as_deref(), thread_provider.as_deref())
-        && requested != pinned
-    {
-        // codex pins the provider at thread start, so an explicit mid-thread
-        // override (e.g. a later `--bedrock`) cannot take effect. Surface it
-        // rather than silently staying on the pinned provider; switching
-        // providers requires a new thread (a harness flag like `--bedrock`
-        // already restarts across harnesses, but a codex->codex provider switch
-        // does not).
-        eprintln!(
-            "Codex provider `{requested}` ignored: this thread is pinned to `{pinned}` \
-             (provider is fixed at thread start; start a new thread to switch providers)"
-        );
+    } else if let Some(pinned) = thread_provider.as_deref() {
+        if model_provider != pinned {
+            // codex pins the provider at thread start, so a later model or
+            // provider that implies a different backend cannot take effect.
+            // Surface it rather than sending a mismatched model to turn/start.
+            let detail = requested_provider
+                .as_deref()
+                .filter(|requested| *requested != pinned)
+                .map(|requested| format!("provider `{requested}`"))
+                .unwrap_or_else(|| format!("model implies provider `{model_provider}`"));
+            eprintln!(
+                "Codex {detail} ignored: this thread is pinned to `{pinned}` \
+                 (provider is fixed at thread start; start a new thread to switch providers)"
+            );
+            turn_model = None;
+        }
     }
     let current_thread_id = thread_id
         .as_ref()
@@ -242,7 +245,7 @@ fn run_codex_user_turn<W: Write>(
     if let Some(client_user_message_id) = client_user_message_id {
         params["clientUserMessageId"] = Value::String(client_user_message_id);
     }
-    if let Some(model) = model {
+    if let Some(model) = turn_model {
         params["model"] = Value::String(model);
     }
     // Per-turn reasoning effort (codex `turn/start.effort`), parsed from the
