@@ -780,17 +780,30 @@ parts of this guide that describe a Python FastAPI control plane are historical.
 
 ### Preinstalled in the VM snapshot (do not reinstall)
 - Rust stable via `rustup` (default toolchain; needed for edition 2024), `uv`, `bun`,
-  `pnpm`, and PostgreSQL 16 + ParadeDB **`pg_search` 0.23.0** (matches chart tag
-  `paradedb/paradedb:0.23.0-pg16`). `uv`/`bun` are on `PATH` via `~/.bashrc`.
-- The startup update script runs `pnpm install --frozen-lockfile` and `cargo fetch`.
+  `pnpm`, `helm` (v3 static binary), and PostgreSQL 16 + ParadeDB **`pg_search` 0.23.0**
+  + **`pg_cron` 1.6** (matches chart tag `paradedb/paradedb:0.23.0-pg16` and its
+  `shared_preload_libraries=pg_search,pg_cron`). `libssl-dev` + `pkg-config` are also
+  installed (needed only by `crates/harness-server`). `uv`/`bun` are on `PATH` via `~/.bashrc`.
+- The startup update script runs `pnpm install --frozen-lockfile` plus `cargo fetch`
+  for both the `services/api-rs` workspace and `crates/harness-server`.
+- **If the VM snapshot is ever lost / rebuilt fresh**, the update script alone will NOT
+  reconstitute the system layer. Re-provision idempotently with: install Rust stable
+  (`rustup toolchain install stable && rustup default stable`), `uv`, `bun`,
+  `postgresql postgresql-contrib libssl-dev pkg-config postgresql-16-cron` (apt), the
+  ParadeDB `pg_search` 0.23.0 pg16 `.deb` from the paradedb GitHub release, set
+  `shared_preload_libraries='pg_search,pg_cron'` + `cron.database_name='centaur'` in
+  `/etc/postgresql/16/main/conf.d/`, then `createdb centaur centaur_test absurd_test`.
 
 ### Postgres (start it yourself — not auto-started)
 - No systemd in the VM. Start with `sudo pg_ctlcluster 16 main start`.
 - Connect as `postgres` / `postgres` on `127.0.0.1:5432`. Databases already created:
   `centaur` (run the server here), `centaur_test` and `absurd_test` (cargo tests).
-- `pg_search` is preloaded via `/etc/postgresql/16/main/conf.d/pg_search.conf` and is
-  **required** by migration `0012` (`create extension pg_search` + a `bm25` index).
-  A vanilla Postgres without `pg_search` will fail migrations and the DB-backed tests.
+- `pg_search` **and** `pg_cron` are preloaded via files in
+  `/etc/postgresql/16/main/conf.d/` (`shared_preload_libraries='pg_search,pg_cron'`,
+  `cron.database_name='centaur'`). `pg_search` is **required** by migration `0012`
+  (`bm25` index); `pg_cron` backs the absurd workflow cron/partition functions
+  (`absurd.enable_cron`, guarded by `to_regclass('cron.job')` in `0007`). A vanilla
+  Postgres without these will fail migration `0012` and disable workflow scheduling.
 
 ### Authoritative checks (mirror `.github/workflows/ci.yml`)
 - Rust, from `services/api-rs`: `cargo fmt --all --check`,
@@ -823,15 +836,48 @@ HTTP routes are `/api/session/{thread_key}` (the `thread_key` must be namespaced
 `<source>:<id>`, e.g. `cli:demo-1`), `.../messages`, `.../execute`, `.../events`
 — not the legacy `/agent/*` paths described earlier.
 
+### Durable workflows E2E (no secrets needed)
+With the server running, drive the absurd workflow engine via REST:
+`POST /api/workflows/runs {"workflow_name":"sleep_echo","input":{"sleep_ms":300}}`
+then poll `GET /api/workflows/runs/{run_id}` until `status:"completed"`. Useful
+built-ins: `echo`, `sleep_echo` (pure durable step→sleep→resume→checkpoint), and
+`agent_turn` (`{"workflow_name":"agent_turn","input":{"prompt":"..."},"harness_type":"codex"}`)
+which drives a full workflow→session-runtime→mock-agent turn and returns
+`result_text:"PONG 1"`.
+
+### crates/harness-server (separate crate; NOT in api-rs workspace or CI)
+Standalone binary (Codex app-server normalizer baked into the sandbox image; see the
+`harness-development` skill). It pulls `codex-*` crates from GitHub (pinned rev) and,
+unlike `services/api-rs` (which uses rustls), needs **OpenSSL dev** headers
+(`libssl-dev` + `pkg-config`, already installed) because the codex deps use
+`reqwest`/native-tls. From `crates/harness-server`: `cargo build`, `cargo fmt --all --check`,
+and `cargo test` pass (7 pass, 4 real-harness tests `#[ignore]`d). `cargo clippy
+--all-targets -- -D warnings` currently reports 3 style lints (collapsible_if x2,
+needless_borrow x1) under clippy 1.96 — pre-existing and not CI-gated (do not "fix"
+during env setup).
+
+### Docs (Vocs) and Helm chart
+- Docs: `docs/` is **npm** (own `package-lock.json`, not in the pnpm workspace) and its
+  `prebuild` needs `bun`. Build with `cd docs && npm install && npm run build` →
+  `docs/dist/`. The OG-card prebuild fetches Google Fonts (network; cached after first run).
+- Helm: `helm dependency update contrib/chart` then `helm lint contrib/chart -f contrib/chart/values.dev.yaml`
+  and `helm template centaur contrib/chart -n centaur -f contrib/chart/values.dev.yaml`
+  all pass (renders ~23 manifests). `dependency update` needs network (1Password chart repo).
+
 ### Not runnable in the Cloud VM as-is
-The full K8s sandbox path (real codex/claude/amp harness), Slack integration, and
-iron-proxy credential injection need Docker + a cluster + 1Password/Slack/LLM
-secrets, none of which exist here.
+The full K8s sandbox path (real codex/claude/amp harness), Slack integration
+(no `SLACK_*` secrets), and iron-proxy credential injection need Docker + a cluster +
+1Password/Slack/LLM secrets, none of which exist here.
 
 ### Python tools / SDK (not in CI)
-`ruff` lint is version-sensitive (run `uvx ruff check .` inside `tools/` or
-`centaur_sdk/`; latest ruff reports many pre-existing findings in `tools/`). SDK
-unit tests:
+`ruff` lint is version-sensitive and `tools/` is **not** clean under any version
+(~637 pre-existing findings on ruff 0.8–0.12; do not try to fix them during setup).
+For reproducible linting pin **`ruff==0.12.0`** (`uvx ruff@0.12.0 check .`); `centaur_sdk/`
+is clean under every version. Tool unit tests are hermetic (they mock httpx and use
+`centaur_sdk` placeholder secrets) — run a tool's tests from its dir with `uv`, adding
+its declared deps, e.g.
+`cd tools/<cat>/<tool> && uv run --no-project --with pytest --with pytest-asyncio --with httpx <+tool deps> python -m pytest -q -o asyncio_mode=auto`.
+SDK unit tests:
 `PYTHONPATH=<repo-root> uv run --with pytest --with pytest-asyncio python -m pytest centaur_sdk/tests -o asyncio_mode=auto`.
 Note: the Cloud VM injects real tool API keys (e.g. `OPENAI_API_KEY`,
 `ALCHEMY_API_KEY`) into the environment, which makes a couple of env-backed
