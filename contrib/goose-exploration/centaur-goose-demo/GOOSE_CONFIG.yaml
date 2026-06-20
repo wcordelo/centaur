@@ -1,0 +1,22 @@
+# Goose Configuration Example
+# Place this or merge into ~/.config/goose/config.yaml
+
+models:
+  default: openai:gpt-4o
+  providers:
+    openai:
+      api_key: env:OPENAI_API_KEY
+    anthropic:
+      api_key: env:ANTHROPIC_API_KEY
+
+extensions:
+  centaur-tools:
+    type: stdio
+    cmd: python3
+    args:
+      - agent/tools/describe_centaur.py
+    description: "Tools for providing information about the Centaur platform"
+
+sessions:
+  history_limit: 50
+  auto_save: true

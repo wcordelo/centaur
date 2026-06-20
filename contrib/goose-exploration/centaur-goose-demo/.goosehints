@@ -1,0 +1,6 @@
+# Goose Hints for Centaur Exploration
+# These hints guide the agent when working in this directory
+
+- Always prefer using the `describe_centaur` tool for architecture questions.
+- Refer to the `contrib/eve-exploration` directory if the user asks for a comparison with Vercel Eve.
+- Use Python 3 for any script execution or tool extensions.
