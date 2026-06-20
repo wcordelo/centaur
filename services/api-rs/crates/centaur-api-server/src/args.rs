@@ -13,10 +13,11 @@ use std::os::unix::fs::PermissionsExt;
 
 use centaur_api_server::SandboxRuntime;
 use centaur_iron_control::{
-    IdentityInput, IronControlClient, RoleSpec, SessionRegistrar, register_role,
+    IdentityInput, IronControlClient, IronControlError, RegisterError, RoleSpec, SessionRegistrar,
+    register_role,
 };
 use centaur_iron_proxy::{
-    ProxyFragment, SourceKind, SourcePolicy, harness_auth_fragment, infra_fragment,
+    ProxyFragment, SourceKind, SourcePolicy, bedrock_enabled, harness_auth_fragment, infra_fragment,
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
@@ -180,7 +181,9 @@ impl IronControlToolReconciler {
             for source in &self.tool_git_sources {
                 source.sync()?;
                 let tools_dir = source.tools_dir();
-                if source.repo_cache_path.is_some() && !tools_dir.is_dir() {
+                // Skip sources without a tools tree (chart-defaulted subdirs
+                // make this a normal case for non-tool overlay repos).
+                if !tools_dir.is_dir() {
                     continue;
                 }
                 dirs.push(tools_dir);
@@ -318,11 +321,15 @@ impl ToolGitSource {
             }
         }
 
+        // A synced source without the tools subdir is skipped by callers, not
+        // an error: with chart-defaulted subdirs, workflows- or skills-only
+        // overlay repos legitimately carry no tools tree.
         if !self.tools_dir().is_dir() {
-            return Err(ServerError::ToolSource(format!(
-                "configured tools subdir does not exist after sync: {}",
-                self.tools_dir().display()
-            )));
+            warn!(
+                repo = %self.repo,
+                tools_dir = %self.tools_dir().display(),
+                "tools subdir missing after sync; skipping tools source"
+            );
         }
         Ok(())
     }
@@ -456,6 +463,16 @@ struct SandboxArgs {
         default_value = "mock"
     )]
     workload: SandboxWorkloadKind,
+    /// The default harness for warm sandboxes. Per-session sandboxes always
+    /// run their session's harness (pinned via container args); this only
+    /// decides what the warm pool boots ahead of time. Defaults to codex
+    /// to match the sandbox image's CMD.
+    #[arg(
+        long = "session-sandbox-harness",
+        env = "SESSION_SANDBOX_HARNESS",
+        default_value = "codex"
+    )]
+    default_harness: HarnessType,
     #[arg(
         long = "session-sandbox-k8s-namespace",
         alias = "kubernetes-namespace",
@@ -580,6 +597,13 @@ struct SandboxArgs {
     #[command(flatten)]
     iron_control: IronControlArgs,
     #[arg(
+        long = "iron-control-sync-infra-secrets",
+        env = "IRON_CONTROL_SYNC_INFRA_SECRETS",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    iron_control_sync_infra_secrets: bool,
+    #[arg(
         long = "workflow-host-sandbox",
         env = "WORKFLOW_HOST_SANDBOX",
         default_value_t = true
@@ -589,6 +613,8 @@ struct SandboxArgs {
     workflow_host_image: Option<String>,
     #[arg(long = "workflow-host-command", env = "WORKFLOW_HOST_COMMAND")]
     workflow_host_command: Option<String>,
+    #[arg(long = "kubernetes-workflow-dirs", env = "KUBERNETES_WORKFLOW_DIRS")]
+    kubernetes_workflow_dirs: Option<String>,
     #[command(flatten)]
     tools_source: ToolsArgs,
     #[arg(
@@ -607,13 +633,31 @@ impl SandboxArgs {
             return Ok(None);
         };
         let namespace = self.iron_control.namespace.clone();
-        let policy = self.iron_proxy.source_policy();
-        let tool_fragment = self.discover_tool_proxy_fragment()?;
-        let roles = self.iron_proxy.roles_to_register(tool_fragment.as_ref())?;
-        let mut role_ids = Vec::with_capacity(roles.len());
-        for (spec, fragment) in &roles {
-            role_ids.push(register_role(&client, &namespace, spec, fragment, &policy).await?);
-        }
+        let role_ids = if self.iron_control_sync_infra_secrets {
+            let policy = self.iron_proxy.source_policy();
+            let tool_fragment = self.discover_tool_proxy_fragment()?;
+            let roles = self.iron_proxy.roles_to_register(tool_fragment.as_ref())?;
+            let mut role_ids = Vec::with_capacity(roles.len());
+            for (spec, fragment) in &roles {
+                role_ids.push(
+                    register_role_with_retry(&client, &namespace, spec, fragment, &policy).await?,
+                );
+            }
+            role_ids
+        } else {
+            let spec = RoleSpec::infra();
+            vec![
+                client
+                    .upsert_role(&IdentityInput {
+                        namespace: namespace.clone(),
+                        foreign_id: spec.foreign_id,
+                        name: spec.name,
+                        labels: BTreeMap::from([("managed-by".to_owned(), "centaur".to_owned())]),
+                    })
+                    .await?
+                    .id,
+            ]
+        };
         let bootstrap = client
             .upsert_principal(&IdentityInput {
                 namespace: namespace.clone(),
@@ -653,6 +697,9 @@ impl SandboxArgs {
     fn iron_control_tool_reconciler(
         &self,
     ) -> Result<Option<IronControlToolReconciler>, ServerError> {
+        if !self.iron_control_sync_infra_secrets {
+            return Ok(None);
+        }
         let Some(client) = self.iron_control.client() else {
             return Ok(None);
         };
@@ -799,8 +846,16 @@ impl SandboxArgs {
     }
 
     fn agent_k8s_workflow_dirs(&self) -> String {
-        if let Some(repo) = clean_optional_value(self.tools_source.repo.as_deref()) {
-            return format!("{SANDBOX_REPOS_MOUNT_PATH}/{repo}/workflows");
+        if let Some(value) = clean_optional_value(self.kubernetes_workflow_dirs.as_deref()) {
+            return value;
+        }
+        let source_repos = self.tools_source.source_repos();
+        if !source_repos.is_empty() {
+            return source_repos
+                .into_iter()
+                .map(|repo| format!("{SANDBOX_REPOS_MOUNT_PATH}/{repo}/workflows"))
+                .collect::<Vec<_>>()
+                .join(":");
         }
         "/opt/centaur/workflows".to_owned()
     }
@@ -849,6 +904,7 @@ impl SandboxArgs {
                 let mut workload = SandboxWorkloadMode::codex_app_server(
                     image,
                     self.codex_app_server_env_template()?,
+                    self.default_harness.clone(),
                 );
                 if let Some(repos_path) = clean_optional_value(self.repos_path.as_deref()) {
                     workload = workload.mount(
@@ -873,7 +929,6 @@ impl SandboxArgs {
     }
 
     fn codex_app_server_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
-        let tool_fragment = self.discover_tool_proxy_fragment()?;
         let mut envs = vec![(
             "CENTAUR_API_URL".to_owned(),
             self.centaur_api_url_override
@@ -897,15 +952,12 @@ impl SandboxArgs {
             envs.push(("CLAUDE_CODE_AUTH_MODE".to_owned(), mode));
         }
 
-        // Inject the proxy fragments' placeholder credentials so env-based
+        // Inject the infra/harness placeholder credentials so env-based
         // consumers send the proxy_value iron-proxy replaces with the real
         // secret: codex's OPENAI_API_KEY (api_key mode → codex logs in and
         // hits api.openai.com instead of falling back to the ChatGPT
-        // auth.json), git's GITHUB_TOKEN, and the rest of the infra/tool set.
-        for (name, value) in self
-            .iron_proxy
-            .sandbox_placeholder_env(tool_fragment.as_ref())?
-        {
+        // auth.json), git's GITHUB_TOKEN, and the rest of the infra set.
+        for (name, value) in self.iron_proxy.sandbox_placeholder_env()? {
             if !envs.iter().any(|(existing, _)| existing == &name) {
                 envs.push((name, value));
             }
@@ -916,6 +968,24 @@ impl SandboxArgs {
                 .any(|(existing, _)| existing == "OPENAI_API_KEY")
         {
             envs.push(("OPENAI_API_KEY".to_owned(), "OPENAI_API_KEY".to_owned()));
+        }
+        if !envs
+            .iter()
+            .any(|(existing, _)| existing == "OPENROUTER_API_KEY")
+        {
+            envs.push((
+                "OPENROUTER_API_KEY".to_owned(),
+                "OPENROUTER_API_KEY".to_owned(),
+            ));
+        }
+        // When Bedrock is enabled, codex's `amazon-bedrock` provider signs with
+        // these placeholder AWS credentials and iron-proxy re-signs (SigV4) with
+        // the real IAM keys. `aws_auth` is not a `secrets` transform, so the
+        // placeholders are injected here rather than via sandbox_placeholder_env.
+        for (name, value) in centaur_iron_proxy::bedrock_sandbox_env() {
+            if !envs.iter().any(|(existing, _)| existing == &name) {
+                envs.push((name, value));
+            }
         }
 
         // OTLP trace wiring rides from this process into every sandbox (the
@@ -1111,13 +1181,9 @@ impl SandboxArgs {
     }
 
     fn workflow_host_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
-        let tool_fragment = self.discover_tool_proxy_fragment()?;
         let mut envs = Vec::new();
 
-        for (name, value) in self
-            .iron_proxy
-            .sandbox_placeholder_env(tool_fragment.as_ref())?
-        {
+        for (name, value) in self.iron_proxy.sandbox_placeholder_env()? {
             envs.push((name, value));
         }
 
@@ -1190,7 +1256,9 @@ impl SandboxArgs {
             for source in sources {
                 source.sync()?;
                 let tools_dir = source.tools_dir();
-                if source.repo_cache_path.is_some() && !tools_dir.is_dir() {
+                // Skip sources without a tools tree (chart-defaulted subdirs
+                // make this a normal case for non-tool overlay repos).
+                if !tools_dir.is_dir() {
                     continue;
                 }
                 dirs.push(tools_dir);
@@ -1214,6 +1282,52 @@ impl SandboxArgs {
             interval: Duration::from_secs(self.sandbox_reap_interval_secs),
             idle_ttl: ttl(self.sandbox_idle_stop_ttl_secs),
             max_lifetime: ttl(self.sandbox_max_lifetime_secs),
+        }
+    }
+}
+
+const IRON_CONTROL_REGISTER_MAX_ATTEMPTS: u32 = 5;
+const IRON_CONTROL_REGISTER_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+
+async fn register_role_with_retry(
+    client: &IronControlClient,
+    namespace: &str,
+    spec: &RoleSpec,
+    fragment: &ProxyFragment,
+    policy: &SourcePolicy,
+) -> Result<String, RegisterError> {
+    let mut backoff = IRON_CONTROL_REGISTER_INITIAL_BACKOFF;
+    for attempt in 1..=IRON_CONTROL_REGISTER_MAX_ATTEMPTS {
+        match register_role(client, namespace, spec, fragment, policy).await {
+            Ok(role_id) => return Ok(role_id),
+            Err(error)
+                if attempt < IRON_CONTROL_REGISTER_MAX_ATTEMPTS
+                    && should_retry_iron_control_register(&error) =>
+            {
+                warn!(
+                    %error,
+                    role = %spec.foreign_id,
+                    attempt,
+                    max_attempts = IRON_CONTROL_REGISTER_MAX_ATTEMPTS,
+                    backoff_ms = backoff.as_millis(),
+                    "iron-control role registration failed; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("iron-control registration retry loop always returns");
+}
+
+fn should_retry_iron_control_register(error: &RegisterError) -> bool {
+    match error {
+        RegisterError::Translate(_) => false,
+        RegisterError::Control(IronControlError::Transport { .. }) => true,
+        RegisterError::Control(IronControlError::Decode { .. }) => false,
+        RegisterError::Control(IronControlError::Status { status, .. }) => {
+            *status == 429 || (500..600).contains(status)
         }
     }
 }
@@ -1261,10 +1375,9 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         config.ready_timeout = Duration::from_secs(args.ready_timeout_secs);
         config.iron_proxy = args.iron_proxy.to_config()?;
         if let Some(proxy) = config.iron_proxy.as_mut() {
-            // The k8s backend derives the static sandbox PG DSN catalog from
-            // these fragments (see `pg_sandbox_dsns`); `to_config` only ships
-            // the harness fragment, so add the infra fragment and the
-            // discovered tool fragment (where `pg_dsn` secrets are declared).
+            // `to_config` only ships the harness fragment, so add infra and
+            // discovered tool fragments for any static proxy placeholder
+            // metadata the backend needs.
             let mut fragments = vec![args.iron_proxy.infra_fragment()?];
             if let Some(tool_fragment) = args.discover_tool_proxy_fragment()? {
                 fragments.push(tool_fragment.fragment);
@@ -1361,6 +1474,31 @@ struct ToolsArgs {
 }
 
 impl ToolsArgs {
+    fn source_repos(&self) -> Vec<String> {
+        let Some(repo) = clean_optional_value(self.repo.as_deref()) else {
+            return Vec::new();
+        };
+        let mut repos = vec![repo];
+        repos.extend(self.extra_sources().into_iter().map(|source| source.repo));
+        repos
+    }
+
+    fn extra_sources(&self) -> Vec<ToolSource> {
+        let Some(value) = clean_optional_value(self.extra_sources.as_deref()) else {
+            return Vec::new();
+        };
+        match serde_json::from_str::<Vec<ToolSourceArg>>(&value) {
+            Ok(sources) => sources
+                .into_iter()
+                .filter_map(ToolSourceArg::into_source)
+                .collect(),
+            Err(err) => {
+                tracing::warn!(error = %err, "invalid KUBERNETES_TOOLS_EXTRA_SOURCES; ignoring extra tool sources");
+                Vec::new()
+            }
+        }
+    }
+
     /// `None` when no repo or runner image is configured (tools disabled).
     fn to_config(&self) -> Option<ToolsConfig> {
         let repo = clean_optional_value(self.repo.as_deref())?;
@@ -1379,19 +1517,7 @@ impl ToolsArgs {
             });
         }
         config.repo_cache_path = clean_optional_value(self.repo_cache_path.as_deref());
-        if let Some(value) = clean_optional_value(self.extra_sources.as_deref()) {
-            match serde_json::from_str::<Vec<ToolSourceArg>>(&value) {
-                Ok(sources) => {
-                    config.extra_sources = sources
-                        .into_iter()
-                        .filter_map(ToolSourceArg::into_source)
-                        .collect();
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "invalid KUBERNETES_TOOLS_EXTRA_SOURCES; ignoring extra tool sources");
-                }
-            }
-        }
+        config.extra_sources = self.extra_sources();
         Some(config)
     }
 }
@@ -1474,12 +1600,12 @@ impl IronProxyArgs {
         let (ca_cert_secret_name, ca_key_secret_name) =
             ca.ok_or(ServerError::MissingIronProxyCaSecret)?;
 
-        let harness_fragment = self.harness.fragment()?;
+        let harness_fragments = self.harness.fragments()?;
         let mut config =
             IronProxyConfig::new(self.image.clone(), ca_cert_secret_name, ca_key_secret_name);
         config.image_pull_policy = self.image_pull_policy.clone();
         self.source.apply_to_config(&mut config);
-        config.fragments = vec![harness_fragment];
+        config.fragments = harness_fragments;
         config.env_from_secret_names = self.env_from_secret_names();
         if let Some(labels) = self
             .api_pod_label_selector
@@ -1509,29 +1635,27 @@ impl IronProxyArgs {
         Ok(vec![(RoleSpec::infra(), infra)])
     }
 
-    /// The full infra fragment: the shared infra secrets plus the harness auth
-    /// (also infra), selected by auth mode. Discovered tool secrets are folded
-    /// into the same infra role at registration time.
+    /// The full infra fragment: the shared infra secrets plus every available
+    /// harness auth fragment (also infra), selected by auth mode. Discovered
+    /// tool secrets are folded into the same infra role at registration time.
     fn infra_fragment(&self) -> Result<ProxyFragment, ServerError> {
         let mut infra = infra_fragment()?;
-        merge_fragment(&mut infra, self.harness.fragment()?);
+        for fragment in self.harness.fragments()? {
+            merge_fragment(&mut infra, fragment);
+        }
         Ok(infra)
     }
 
-    /// Placeholder env (`PLACEHOLDER=PLACEHOLDER`) for every secret the proxy
-    /// fragments declare — infra, harness, and tools — so env-based consumers
-    /// in the sandbox send the proxy_value iron-proxy replaces with the real
-    /// credential (codex's `OPENAI_API_KEY`, git's `GITHUB_TOKEN`, …). Mirrors
-    /// the full fragment set registered as iron-control roles.
-    fn sandbox_placeholder_env(
-        &self,
-        tool_fragment: Option<&DiscoveredToolProxyFragment>,
-    ) -> Result<BTreeMap<String, String>, ServerError> {
-        let mut fragments = vec![self.infra_fragment()?];
-        if let Some(tool_fragment) = tool_fragment {
-            fragments.push(tool_fragment.fragment.clone());
-        }
-        Ok(centaur_iron_proxy::placeholder_env(&fragments))
+    /// Placeholder env (`PLACEHOLDER=PLACEHOLDER`) for the infra/harness
+    /// secrets, whose consumers read credentials straight from the environment
+    /// (codex's `OPENAI_API_KEY`, git's `GITHUB_TOKEN`, …). Discovered tool
+    /// secrets contribute nothing here: tools read credentials through the SDK,
+    /// whose `StubBackend` already returns the key name iron-proxy matches on,
+    /// and the cloudwatch tool embeds its own throwaway SigV4 credentials.
+    fn sandbox_placeholder_env(&self) -> Result<BTreeMap<String, String>, ServerError> {
+        Ok(centaur_iron_proxy::placeholder_env(&[
+            self.infra_fragment()?
+        ]))
     }
 
     fn env_from_secret_names(&self) -> Vec<String> {
@@ -1675,6 +1799,42 @@ impl IronProxyHarnessArgs {
                 "no harness auth fragment for engine {engine} auth-mode {auth_mode}"
             ))
         })
+    }
+
+    /// Every harness auth fragment to register. The configured engine's
+    /// fragment is required (startup fails without it, as before); the other
+    /// engines' fragments are added when their engine/auth-mode pair has one,
+    /// so sessions restarted onto another harness still get working
+    /// credentials through the proxy.
+    fn fragments(&self) -> Result<Vec<ProxyFragment>, ServerError> {
+        let mut fragments = vec![self.fragment()?];
+        for engine in [
+            HarnessType::Codex,
+            HarnessType::ClaudeCode,
+            HarnessType::Amp,
+        ] {
+            if engine == self.engine {
+                continue;
+            }
+            let auth_mode = harness_auth_mode_env(&engine).unwrap_or_else(|| "api_key".to_owned());
+            if let Some(fragment) =
+                harness_auth_fragment(harness_fragment_engine_name(&engine), &auth_mode)?
+            {
+                fragments.push(fragment);
+            }
+        }
+        if let Some(fragment) = harness_auth_fragment("openrouter", "api_key")? {
+            fragments.push(fragment);
+        }
+        // Bedrock is opt-in (not the default codex provider): only register its
+        // SigV4 re-signing fragment when the operator has set CODEX_BEDROCK_REGION,
+        // since the fragment expects AWS keys in the secrets backend.
+        if bedrock_enabled()
+            && let Some(fragment) = harness_auth_fragment("amazon-bedrock", "api_key")?
+        {
+            fragments.push(fragment);
+        }
+        Ok(fragments)
     }
 }
 
@@ -1944,6 +2104,28 @@ mod tests {
     }
 
     #[test]
+    fn iron_control_registration_retry_policy_is_transient_only() {
+        let status_error = |status| {
+            RegisterError::Control(IronControlError::Status {
+                method: "PUT".to_owned(),
+                path: "/api/v1/static_secrets/example".to_owned(),
+                status,
+                body: String::new(),
+            })
+        };
+
+        assert!(should_retry_iron_control_register(&status_error(500)));
+        assert!(should_retry_iron_control_register(&status_error(503)));
+        assert!(should_retry_iron_control_register(&status_error(429)));
+        assert!(!should_retry_iron_control_register(&status_error(400)));
+        assert!(!should_retry_iron_control_register(
+            &RegisterError::Translate(centaur_iron_control::TranslateError::Unsupported {
+                what: "unsupported transform".to_owned(),
+            })
+        ));
+    }
+
+    #[test]
     fn parses_session_sandbox_flags() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2062,6 +2244,54 @@ mod tests {
     }
 
     #[test]
+    fn agent_k8s_workflow_dirs_fan_out_across_extra_sources() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--kubernetes-tools-repo",
+            "paradigmxyz/centaur",
+            "--kubernetes-tools-runner-image",
+            "centaur-agent:test",
+            "--kubernetes-tools-extra-sources",
+            r#"[{"repo":"acme/overlay"},{"repo":"acme/other","subdir":"packages/tools"}]"#,
+        ])
+        .unwrap();
+
+        // Every source contributes its repo-root `workflows/` tree, base first,
+        // colon-joined. The tools `subdir` does not affect the workflows path.
+        assert_eq!(
+            args.sandbox.agent_k8s_workflow_dirs(),
+            "/home/agent/github/paradigmxyz/centaur/workflows:\
+             /home/agent/github/acme/overlay/workflows:\
+             /home/agent/github/acme/other/workflows",
+        );
+    }
+
+    #[test]
+    fn agent_k8s_workflow_dirs_falls_back_when_tools_disabled() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox.agent_k8s_workflow_dirs(),
+            "/opt/centaur/workflows"
+        );
+    }
+
+    #[test]
     fn agent_k8s_workflow_host_mounts_repos_and_tool_env() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2077,6 +2307,8 @@ mod tests {
             "/home/agent/github/paradigmxyz/centaur/tools",
             "--tools-overlay-path",
             "/home/agent/github/tempoxyz/centaur-tempo/tools",
+            "--kubernetes-workflow-dirs",
+            "/home/agent/github/paradigmxyz/centaur/workflows:/home/agent/github/tempoxyz/centaur-tempo/workflows",
             "--session-sandbox-passthrough-env",
             "TOOLS_PATH,TOOLS_OVERLAY_PATH",
         ])
@@ -2105,6 +2337,15 @@ mod tests {
                 .find(|env| env.name == "TOOLS_OVERLAY_PATH")
                 .map(|env| env.value.as_str()),
             Some("/home/agent/github/tempoxyz/centaur-tempo/tools")
+        );
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == "WORKFLOW_DIRS")
+                .map(|env| env.value.as_str()),
+            Some(
+                "/home/agent/github/paradigmxyz/centaur/workflows:/home/agent/github/tempoxyz/centaur-tempo/workflows"
+            )
         );
     }
 
@@ -2179,6 +2420,10 @@ mod tests {
         assert!(
             env.iter()
                 .any(|(name, value)| name == "OPENAI_API_KEY" && value == "OPENAI_API_KEY")
+        );
+        assert!(
+            env.iter()
+                .any(|(name, value)| name == "OPENROUTER_API_KEY" && value == "OPENROUTER_API_KEY")
         );
     }
 
@@ -2579,6 +2824,30 @@ mod tests {
     }
 
     #[test]
+    fn iron_control_infra_secret_sync_can_be_disabled() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--iron-control-url",
+            "http://console.local",
+            "--iron-control-api-key",
+            "iak_test",
+            "--iron-control-sync-infra-secrets",
+            "false",
+        ])
+        .unwrap();
+
+        assert!(!args.sandbox.iron_control_sync_infra_secrets);
+        assert!(
+            args.sandbox
+                .iron_control_tool_reconciler()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn codex_workload_mounts_repos_path_read_only() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2592,10 +2861,14 @@ mod tests {
         .unwrap();
 
         let workload = args.sandbox.container_workload_mode().unwrap();
-        let SandboxWorkloadMode::CodexAppServer { mounts, .. } = workload else {
+        let SandboxWorkloadMode::CodexAppServer {
+            harness, mounts, ..
+        } = workload
+        else {
             panic!("expected codex app server workload");
         };
 
+        assert_eq!(harness, HarnessType::Codex);
         assert!(mounts.iter().any(|mount| {
             mount.target_path == SANDBOX_REPOS_MOUNT_PATH
                 && mount.read_only

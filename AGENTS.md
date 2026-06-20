@@ -211,7 +211,7 @@ This means clients and the API never need to know about harness-specific quirks.
 
 **Sandbox → API** (REST over Kubernetes services):
 
-Agents call tools via `curl $CENTAUR_API_URL/tools/<tool>/<method>` over the in-cluster service network. Auth is via `CENTAUR_API_KEY` injected when the sandbox Pod is created.
+Agents call tools through the generated `centaur-tools` catalog and direct tool CLIs. The tool runtime handles routing and credential access.
 
 ### Network Isolation
 
@@ -401,7 +401,7 @@ Runs go through: `queued → running → sleeping/waiting → running → … �
 
 - **Worker pool**: `WORKFLOW_WORKER_CONCURRENCY` workers (default 2) poll for claimable runs.
 - **Lease-based fencing**: Each worker holds a lease on its run, extended by a heartbeat. If the worker dies, the lease expires and another worker reclaims the run.
-- **Schedules**: Cron-based or interval-based schedules are configured in `workflow_schedules` table and ticked by the worker loop.
+- **Schedules**: Cron-based or interval-based schedules are discovered from workflow metadata by `api-rs`. The scheduler stores tick tasks in the Absurd `centaur_workflow_schedules` queue.
 - **External events**: `POST /workflows/events` delivers events that wake waiting runs.
 - **Child workflows**: Parent→child relationships are tracked; cancelling a parent cascels linked executions.
 
@@ -429,10 +429,13 @@ Runs go through: `queued → running → sleeping/waiting → running → … �
 
 | Table | What |
 |-------|------|
-| `workflow_runs` | Run metadata, status, input/output, parent/root hierarchy |
-| `workflow_checkpoints` | Per-step cached results, linked execution/child-run IDs |
-| `workflow_schedules` | Cron/interval schedule definitions with next_run_at tracking |
-| `workflow_events` | External events for `wait_for_event` correlation |
+| `absurd.queues` | Registered workflow queues, including standard, ETL, backfill, Slack-live, and schedule queues |
+| `absurd.t_centaur_workflows*` | Workflow task metadata, state, input params, idempotency keys, and completed payloads |
+| `absurd.r_centaur_workflows*` | Per-attempt run state, leases, timing, result payloads, and failures |
+| `absurd.c_centaur_workflows*` | Per-step checkpoint state |
+| `absurd.e_centaur_workflows*` | Emitted workflow events for event-driven resumes |
+| `absurd.w_centaur_workflows*` | Wait registrations for sleeps and external events |
+| `absurd.t_centaur_workflow_schedules` | Scheduler tick tasks for registered cron and interval schedules |
 
 ## Agent Sandbox
 
@@ -446,17 +449,15 @@ The sandbox image bakes `services/sandbox/SYSTEM_PROMPT.md` into `~/AGENTS.md` a
 
 The system prompt tells the agent:
 - **Identity**: it's running inside a Kubernetes sandbox pod, calling back to the API for tool access
-- **Tools**: three kinds — harness built-ins (Read, Bash, etc.), API tools via the `call` helper, and a headless browser
-- **`call` helper** (`/usr/local/bin/call`): a bash wrapper around `curl` that provides a concise syntax for API tool calls. `call slack get_channel_history '{"channel":"general"}'` instead of a full curl command. Returns TOON format for token efficiency.
+- **Tools**: three kinds — harness built-ins (Read, Bash, etc.), API tools exposed as shell CLI shims, and a headless browser
+- **Tool CLIs**: each tool is installed as a shell command at container startup by `services/sandbox/install_tool_shims.py`, which scans `TOOL_DIRS` for `pyproject.toml [project.scripts]` and `uvx`-installs each. Agents call tools directly (`slack get_channel_history '{"channel":"general"}'`, `<tool> --help` to discover) — there is no `call` helper.
 - **Slack messaging**: the agent's stdout IS the Slack reply — never call `send_message` on the active thread
-- **Dashboard blocks**: fenced code blocks with `dashboard` language tag render structured tables, charts, and KPI cards in compatible Centaur clients
 - **Rules**: never display secrets, show your work, lead with the answer
 
-The `call` helper (`services/sandbox/call.sh`) handles routing:
-- `call <tool> <method> [json]` → `POST /tools/<tool>/<method>`
-- `call discover <tool>` → `GET /tools/<tool>`
-
-Legacy `call search` / `call sql` shorthands were removed. Sandbox agents should call the concrete tool directly, for example `call websearch search '{"query":"..."}'` or another deployment-specific query method discovered via `call discover <tool>`.
+`centaur-tools` is the generated catalog CLI emitted by the same installer:
+- `centaur-tools list` → list available tool CLIs
+- `centaur-tools run <tool> [args]` → run a tool CLI
+- `centaur-tools call <tool> <method> [json]` → internal method bridge kept only for the Python workflow host's `ctx.call_tool(...)`; interactive agents use the direct tool CLIs above.
 
 ### Persona System
 
@@ -465,7 +466,7 @@ The entrypoint supports persona overlays via `AGENT_PERSONA`. Persona prompts ar
 ### Sandbox Pod Config
 
 - Runs under Kubernetes NetworkPolicies with API reachable through the in-cluster service URL
-- Entrypoint injects `CENTAUR_API_URL` and `CENTAUR_API_KEY` env vars
+- Entrypoint injects the runtime URLs and tool catalog environment needed by the sandbox
 - Stub API keys so harnesses init in API-key mode (not browser login)
 - `HTTPS_PROXY` routes LLM calls through the firewall
 - Resource limits: 4GB memory, 2 CPUs
@@ -480,9 +481,11 @@ Sandbox Pods never see real API keys. The firewall (`services/firewall/addon.py`
 |-------------|--------|--------|
 | `api.anthropic.com` | `x-api-key` | raw |
 | `api.openai.com` | `authorization` | bearer |
+| `openrouter.ai` | `authorization` | bearer |
 | `ampcode.com` | `authorization` | bearer |
 | `api.github.com` | `authorization` | token |
 | `github.com` | `authorization` | basic auth |
+| `bedrock-mantle.<region>.api.aws` | `authorization` + `x-amz-*` | AWS SigV4 re-sign (opt-in, codex `amazon-bedrock`) |
 
 ### Session Persistence
 
@@ -494,7 +497,7 @@ Sandbox Pods never see real API keys. The firewall (`services/firewall/addon.py`
 ## Security Model
 
 - **API auth**: All callers authenticate with DB-backed API keys (`aiv2_*` prefix, stored in `api_keys` table). Local in-cluster service calls use the configured bypass paths where applicable.
-- **Sandbox auth**: Sandbox Pods get auto-issued HMAC-signed tokens (`sbx1.*` prefix) minted by the API. These are short-lived (2h TTL) and scoped to `agent` + `tools:*`.
+- **Sandbox auth**: Sandbox Pods use the runtime's tool and workflow surfaces; agents should not depend on a user-visible Centaur API key.
 - **Slack**: HMAC-SHA256 signature verification on all webhooks
 - **Public edge**: The Helm chart exposes public routes only when configured through Ingress, HTTPRoute, or service settings.
 - **Sandbox isolation**: Pods get stub keys only; real keys injected by firewall proxy in-flight
@@ -510,12 +513,11 @@ All API authentication uses **DB-backed keys** stored in the `api_keys` Postgres
 | Type | Prefix | Issued by | Used by | Scopes |
 |------|--------|-----------|---------|--------|
 | DB keys | `aiv2_*` | Admin API | Slackbot, CLI, external callers | Per-key (e.g. `["*"]`, `["agent:execute"]`) |
-| Sandbox tokens | `sbx1.*` | API (automatic) | Sandbox containers → API tool calls | `["agent", "tools:*"]` |
 
 ### How services get their keys
 
 - **Slackbot**: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, and `SLACKBOT_API_KEY` are injected from the local infra Secret.
-- **Sandbox containers**: Auto-issued `sbx1.*` token injected as `CENTAUR_API_KEY` at container creation
+- **Sandbox containers**: Use runtime-provided tool CLIs and workflow context rather than a direct Centaur API key
 - **Local testing**: Use localhost bypass (no key needed from inside the API deployment), or create a key via admin API
 
 ## Secrets

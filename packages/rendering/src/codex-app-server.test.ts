@@ -78,17 +78,157 @@ describe('CodexAppServerRendererEventMapper', () => {
 
     expect(events.some(event => event.type === 'renderer.message.delta')).toBe(false)
     const task = events.find(event => event.type === 'renderer.task.update')
+    // Sealed commentary stays in_progress until the next activity starts so
+    // "Thinking completed" never headlines the Slack plan card mid-turn.
     expect(task).toMatchObject({
       type: 'renderer.task.update',
       task: {
         id: 'thinking-thinking-1',
         title: 'Thinking',
-        status: 'complete'
+        status: 'in_progress'
       }
     })
     expect(plain(task?.type === 'renderer.task.update' ? task.task.details : undefined)).toContain(
       'Checking the runtime.'
     )
+
+    const next = mapper.process({
+      type: 'item.started',
+      item: { id: 'cmd-1', type: 'commandExecution', command: 'pnpm test' }
+    })
+    expect(next.find(event => event.type === 'renderer.task.update')).toMatchObject({
+      task: { id: 'thinking-thinking-1', title: 'Thinking', status: 'complete' }
+    })
+  })
+
+  it('keeps one Thinking task in_progress across reasoning deltas until the item seals', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+
+    const first = mapper.process({
+      type: 'item.reasoning.textDelta',
+      itemId: 'reasoning-1',
+      delta: 'Inspecting the '
+    })
+    expect(first).toContainEqual({
+      type: 'renderer.task.update',
+      task: {
+        id: 'reasoning-1',
+        title: 'Thinking',
+        status: 'in_progress',
+        details: [{ type: 'text', text: 'Inspecting the' }],
+        output: undefined
+      },
+      flush: true
+    })
+
+    // A command starting mid-thought must not flip the Thinking task to complete.
+    mapper.process({
+      type: 'item.started',
+      item: { id: 'cmd-1', type: 'commandExecution', command: 'pnpm test' }
+    })
+
+    const second = mapper.process({
+      type: 'item.reasoning.textDelta',
+      itemId: 'reasoning-1',
+      delta: 'event stream'
+    })
+    const secondUpdate = second.find(event => event.type === 'renderer.task.update')
+    expect(secondUpdate).toMatchObject({
+      task: { id: 'reasoning-1', title: 'Thinking', status: 'in_progress' }
+    })
+    expect(
+      plain(secondUpdate?.type === 'renderer.task.update' ? secondUpdate.task.details : undefined)
+    ).toContain('Inspecting the event stream')
+
+    // Sealing completes the Thinking task; the still-running command keeps
+    // the plan in an in-progress state so the Slack header tracks it.
+    const sealed = mapper.process({
+      type: 'item.completed',
+      item: { id: 'reasoning-1', type: 'reasoning', content: ['Inspecting the event stream'] }
+    })
+    const sealedUpdate = sealed.find(event => event.type === 'renderer.task.update')
+    expect(sealedUpdate).toMatchObject({
+      task: { id: 'reasoning-1', title: 'Thinking', status: 'complete' }
+    })
+  })
+
+  it('holds the last finished task in_progress so the Slack header never claims completion mid-turn', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+
+    mapper.process({
+      type: 'item.started',
+      item: { id: 'cmd-1', type: 'commandExecution', command: 'pnpm test' }
+    })
+
+    // The command finishes, leaving nothing else running. Slack would show
+    // "Thinking completed" for an all-complete plan, so the completion is
+    // held back and the task stays presented as in_progress.
+    const completed = mapper.process({
+      type: 'item.completed',
+      item: {
+        id: 'cmd-1',
+        type: 'commandExecution',
+        command: 'pnpm test',
+        aggregatedOutput: 'tests passed',
+        status: 'completed'
+      }
+    })
+    const heldUpdate = completed.find(event => event.type === 'renderer.task.update')
+    expect(heldUpdate).toMatchObject({
+      task: { id: 'cmd-1', status: 'in_progress' }
+    })
+
+    // The next command releases the held completion in the same batch,
+    // ordered before the new task's in_progress update.
+    const next = mapper.process({
+      type: 'item.started',
+      item: { id: 'cmd-2', type: 'commandExecution', command: 'pnpm build' }
+    })
+    const updates = next.filter(event => event.type === 'renderer.task.update')
+    const firstIndex = updates.findIndex(
+      update => update.type === 'renderer.task.update' && update.task.id === 'cmd-1'
+    )
+    const secondIndex = updates.findIndex(
+      update => update.type === 'renderer.task.update' && update.task.id === 'cmd-2'
+    )
+    expect(updates[firstIndex]).toMatchObject({ task: { id: 'cmd-1', status: 'complete' } })
+    expect(updates[secondIndex]).toMatchObject({ task: { id: 'cmd-2', status: 'in_progress' } })
+    expect(firstIndex).toBeLessThan(secondIndex)
+
+    // The final flush reports true statuses for everything.
+    const done = mapper.flush()
+    const finalStatuses = done
+      .filter(event => event.type === 'renderer.task.update')
+      .map(event => (event.type === 'renderer.task.update' ? event.task : null))
+    expect(finalStatuses).toContainEqual(
+      expect.objectContaining({ id: 'cmd-2', status: 'complete' })
+    )
+  })
+
+  it('separates Codex reasoning summary sections within one Thinking task', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+
+    mapper.process({
+      type: 'item.reasoning.summaryTextDelta',
+      itemId: 'reasoning-1',
+      summaryIndex: 0,
+      delta: 'First section.'
+    })
+    const events = mapper.process({
+      type: 'item.reasoning.summaryTextDelta',
+      itemId: 'reasoning-1',
+      summaryIndex: 1,
+      delta: 'Second section.'
+    })
+    const update = events.find(event => event.type === 'renderer.task.update')
+    expect(update).toMatchObject({
+      task: {
+        id: 'reasoning-1',
+        title: 'Thinking',
+        status: 'in_progress',
+        details: [{ type: 'text', text: 'First section.\n\nSecond section.' }]
+      }
+    })
   })
 
   it('parses Rust session output lines before mapping app-server notifications', () => {
@@ -284,6 +424,54 @@ describe('CodexAppServerRendererEventMapper', () => {
     expect(chunks).toContainEqual({ type: 'markdown_text', text: 'Done.' })
   })
 
+  it('coalesces repeated reasoning deltas into one Thinking task', async () => {
+    const chunks = await collect(
+      codexAppServerToChatSdkStream(
+        toAsyncIterable([
+          {
+            method: 'item/reasoning/summaryTextDelta',
+            params: {
+              itemId: 'reasoning-1',
+              delta: 'Inspecting '
+            }
+          },
+          {
+            method: 'item/reasoning/summaryTextDelta',
+            params: {
+              itemId: 'reasoning-1',
+              delta: 'the event stream'
+            }
+          },
+          {
+            method: 'turn/completed',
+            params: {
+              turn: { id: 'turn-1', items: [], status: 'completed' }
+            }
+          }
+        ])
+      )
+    )
+
+    const thinkingChunks = chunks.filter(
+      (chunk): chunk is Extract<(typeof chunks)[number], { type: 'task_update' }> =>
+        chunk.type === 'task_update' && chunk.title === 'Thinking'
+    )
+    expect(new Set(thinkingChunks.map(chunk => chunk.id))).toEqual(new Set(['reasoning-1']))
+    expect(thinkingChunks).toContainEqual({
+      type: 'task_update',
+      id: 'reasoning-1',
+      title: 'Thinking',
+      status: 'in_progress',
+      details: 'Inspecting the event stream'
+    })
+    expect(thinkingChunks).toContainEqual({
+      type: 'task_update',
+      id: 'reasoning-1',
+      title: 'Thinking',
+      status: 'complete'
+    })
+  })
+
   it('streams command details once and command output incrementally', async () => {
     const chunks = await collect(
       codexAppServerToChatSdkStream(
@@ -454,6 +642,45 @@ describe('CodexAppServerRendererEventMapper', () => {
     )
     expect(taskChunk?.output).toContain('[binary output omitted;')
     expect(taskChunk?.output).not.toContain('\u0000')
+  })
+
+  it('suppresses the live delta instead of interleaving when the recomposed answer diverges from streamed text', () => {
+    // Two concurrent final-answer items compose as A + B. Growing A (a
+    // non-trailing component) after B was already streamed shifts B's bytes, so
+    // a byte-offset slice would re-read and re-emit B, duplicating it
+    // ("Hello world." -> "Hello world.world."). The guard refuses the
+    // non-continuation and freezes at the clean prefix instead, and records the
+    // divergence once for the metric.
+    const logs: string[] = []
+    const mapper = new CodexAppServerRendererEventMapper({
+      logInfo: event => logs.push(event)
+    })
+
+    const deltas: string[] = []
+    const run = (event: unknown) => {
+      for (const out of mapper.process(event)) {
+        if (out.type === 'renderer.message.delta') deltas.push(out.delta)
+      }
+    }
+
+    // A task makes the plan visible so answer deltas stream immediately.
+    run({ type: 'item.started', item: { id: 'cmd-1', type: 'commandExecution', command: 'true' } })
+    run({ type: 'item.started', item: { id: 'A', type: 'agentMessage', phase: 'final_answer' } })
+    run({ type: 'item.started', item: { id: 'B', type: 'agentMessage', phase: 'final_answer' } })
+    run({ type: 'item.agentMessage.delta', itemId: 'A', delta: 'Hello ' })
+    run({ type: 'item.agentMessage.delta', itemId: 'B', delta: 'world.' })
+    // A grows after B was already streamed: a byte-offset slice would duplicate
+    // "world." here. The guard suppresses the non-continuation instead.
+    run({ type: 'item.agentMessage.delta', itemId: 'A', delta: 'there ' })
+
+    const streamed = deltas.join('')
+    expect(streamed).toBe('Hello world.')
+    expect(streamed).not.toContain('world.world.')
+    expect(logs).toContain('codex_renderer_stream_divergence_suppressed')
+    // The signal is recorded once per render, not on every subsequent event.
+    expect(logs.filter(event => event === 'codex_renderer_stream_divergence_suppressed')).toHaveLength(
+      1
+    )
   })
 
   it('marks open tasks as errors on Rust session failures and emits done', () => {

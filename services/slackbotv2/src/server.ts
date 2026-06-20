@@ -26,10 +26,11 @@ const consoleLogger = {
 
 const options: SlackbotV2Options = {
   apiUrl,
-  apiKey: optionalEnv('SLACKBOT_API_KEY') ?? optionalEnv('CENTAUR_API_KEY'),
+  apiKey: optionalEnv('SLACKBOT_API_KEY'),
   assistantStatus: optionalEnv('SLACKBOTV2_ASSISTANT_STATUS'),
   botToken,
   botUserId: optionalEnv('SLACK_BOT_USER_ID'),
+  defaultHarnessType: optionalEnv('SLACKBOTV2_DEFAULT_HARNESS'),
   idleTimeoutMs: optionalNumberEnv('SESSION_IDLE_TIMEOUT_MS'),
   maxDurationMs: optionalNumberEnv('SESSION_MAX_DURATION_MS'),
   postgresUrl:

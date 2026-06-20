@@ -42,9 +42,10 @@ Use `secret("KEY")` to access. Never use `os.environ` — tool secrets are scope
 
 ## Available Plugins
 
-The open-source tool inventory lives in this `tools/` tree and changes over time. To see what ships in the current repo, inspect the directories here or run Centaur and call `call tools` from a sandbox session.
+The open-source tool inventory lives in this `tools/` tree and changes over time. To see what ships in a running sandbox, use `centaur-tools list`; private deployments may mount additional overlay tool directories.
 
-Private deployments may mount additional overlay tool directories, so a running Centaur instance can expose more tools than are present in this repo.
+- `centaur_investigator`: parse Centaur Slack thread references and enrich them
+  with best-effort vlogs/vmetrics context without exposing message context.
 
 ## Sandbox Tool Paths
 

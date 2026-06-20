@@ -4,9 +4,9 @@ import { Hono, type Context } from 'hono'
 import {
   Chat,
   Message,
-  StreamingPlan,
   type ActionEvent,
   type Adapter,
+  type Attachment,
   type Logger,
   type Message as ChatMessage,
   type StateAdapter,
@@ -23,11 +23,14 @@ import {
   type RendererEvent
 } from '@centaur/rendering'
 import { conflateChatSdkStream } from './conflate'
+import { observeSeconds, slackbotMetrics } from './metrics'
 import {
   collectInitialContext,
   forwardToSessionApi,
+  harnessRestartPreamble,
   isRetryableSessionApiError,
   openSessionEventStream,
+  serializeAttachment,
   serializeMessage,
   sessionStreamError
 } from './session-api'
@@ -37,7 +40,9 @@ import { parseQuickAction, quickActionPrompt } from './quick-actions'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
 import type {
   ForwardSessionInput,
+  JsonObject,
   SlackbotV2,
+  SlackbotV2ApiAttachment,
   SlackbotV2ApiMessage,
   SlackbotV2ExecuteSessionResponse,
   SlackbotV2MessageMode,
@@ -47,7 +52,17 @@ import type {
   SlackbotV2ThreadState,
   SlackbotV2Trace
 } from './types'
-import { elapsedMs, errorMessage, noopLogger, nowMs, traceLog } from './utils'
+import {
+  elapsedMs,
+  errorMessage,
+  isJsonObject,
+  noopLogger,
+  nowMs,
+  startPendingOperationLog,
+  stringValue,
+  traceLog,
+  traceWarn
+} from './utils'
 
 export type {
   SlackbotV2,
@@ -77,6 +92,8 @@ type SlackAssistantAdapter = {
   ): Promise<void>
   setAssistantTitle?(channelId: string, threadTs: string, title: string): Promise<void>
 }
+
+const MAX_SLACK_MESSAGE_ATTACHMENTS = 20
 
 type SlackbotV2RequestContext = {
   retryableErrors: unknown[]
@@ -120,20 +137,24 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
 
   chat.onNewMention(async (thread, message) => {
     if (!isAllowedSlackMessage(message, options, logger)) return
-    await thread.subscribe()
-    await syncThreadMessageToSession(thread, message, {
+    await handleSlackMessageHandoff(thread, message, {
+      assistantStatusRequested: true,
       mode: 'execute',
       options,
-      state
+      state,
+      subscribe: true,
+      trigger: 'new_mention'
     })
   })
 
   chat.onSubscribedMessage(async (thread, message) => {
     if (!isAllowedSlackMessage(message, options, logger)) return
-    await syncThreadMessageToSession(thread, message, {
+    await handleSlackMessageHandoff(thread, message, {
+      assistantStatusRequested: message.isMention === true,
       mode: message.isMention === true ? 'execute' : 'append',
       options,
-      state
+      state,
+      trigger: 'subscribed_message'
     })
   })
 
@@ -146,45 +167,94 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
 
   const app = new Hono()
   app.get('/health', c => c.json({ ok: true, service: 'slackbotv2' }))
+  app.get('/metrics', c =>
+    c.text(slackbotMetrics.expose(), 200, {
+      'Content-Type': 'text/plain; version=0.0.4; charset=utf-8'
+    })
+  )
   const handleSlackWebhook = async (c: Context) => {
+    const webhookStartedAtMs = nowMs()
+    const route = c.req.path
     const rawBody = await c.req.raw.clone().text()
-    if (!isAllowedSlackWebhookBody(rawBody, options, logger)) {
-      return new globalThis.Response('ok', { status: 200 })
-    }
-    const awaitHandoff = shouldAwaitSlackHandoff(rawBody)
-    const handoffTasks: Promise<unknown>[] = []
-    const context: SlackbotV2RequestContext = {
-      retryableErrors: [],
-      waitUntil: promise => waitUntil(c, promise)
-    }
-    const response = await requestContext.run(context, () => {
-      return chat.webhooks.slack(c.req.raw, {
-        waitUntil: promise => {
-          if (awaitHandoff) {
-            handoffTasks.push(promise)
-          } else {
-            waitUntil(c, promise)
+    const eventType = slackWebhookEventType(rawBody)
+    let outcome = 'success'
+    try {
+      if (!isAllowedSlackWebhookBody(rawBody, options, logger)) {
+        outcome = 'ignored'
+        return new globalThis.Response('ok', { status: 200 })
+      }
+      const awaitHandoff = shouldAwaitSlackHandoff(rawBody)
+      const webhookFields = slackWebhookLogFields(rawBody)
+      const handoffTasks: Promise<unknown>[] = []
+      const context: SlackbotV2RequestContext = {
+        retryableErrors: [],
+        waitUntil: promise => waitUntil(c, promise)
+      }
+      const response = await requestContext.run(context, () => {
+        return chat.webhooks.slack(c.req.raw, {
+          waitUntil: promise => {
+            if (awaitHandoff) {
+              handoffTasks.push(promise)
+            } else {
+              waitUntil(c, promise)
+            }
           }
-        }
-      })
-    })
-    if (awaitHandoff && response.ok) {
-      try {
-        await Promise.all(handoffTasks)
-      } catch (error) {
-        if (isRetryableSessionApiError(error)) context.retryableErrors.push(error)
-      }
-      if (context.retryableErrors.length > 0) {
-        traceLog(options, 'slackbotv2_webhook_retry_requested', undefined, {
-          error: errorMessage(context.retryableErrors[0])
         })
-        return new globalThis.Response('temporary upstream unavailable', { status: 503 })
+      })
+      if (awaitHandoff && response.ok) {
+        const waitStartedAtMs = nowMs()
+        const waitFields = {
+          ...webhookFields,
+          response_status: response.status,
+          task_count: handoffTasks.length
+        }
+        traceLog(options, 'slackbotv2_webhook_handoff_wait_started', undefined, waitFields)
+        const stopPendingLog = startPendingOperationLog(
+          options,
+          'slackbotv2_webhook_handoff_wait_pending',
+          undefined,
+          waitFields,
+          waitStartedAtMs
+        )
+        let waitError: unknown
+        try {
+          await Promise.all(handoffTasks)
+        } catch (error) {
+          waitError = error
+          if (isRetryableSessionApiError(error)) context.retryableErrors.push(error)
+        } finally {
+          stopPendingLog()
+          traceLog(options, 'slackbotv2_webhook_handoff_wait_complete', undefined, {
+            ...waitFields,
+            error: waitError ? errorMessage(waitError) : undefined,
+            phase_ms: elapsedMs(waitStartedAtMs),
+            retryable_error_count: context.retryableErrors.length
+          })
+        }
+        if (context.retryableErrors.length > 0) {
+          outcome = 'retry_requested'
+          slackbotMetrics.webhookRetryRequests.inc()
+          traceLog(options, 'slackbotv2_webhook_retry_requested', undefined, {
+            error: errorMessage(context.retryableErrors[0])
+          })
+          return new globalThis.Response('temporary upstream unavailable', { status: 503 })
+        }
       }
+      outcome = response.ok ? 'success' : 'error'
+      return new globalThis.Response(await response.text(), {
+        headers: response.headers,
+        status: response.status
+      })
+    } catch (error) {
+      outcome = 'error'
+      throw error
+    } finally {
+      slackbotMetrics.webhookRequests.inc({ event_type: eventType, outcome, route })
+      slackbotMetrics.webhookDuration.observe(
+        { event_type: eventType, outcome, route },
+        observeSeconds(webhookStartedAtMs)
+      )
     }
-    return new globalThis.Response(await response.text(), {
-      headers: response.headers,
-      status: response.status
-    })
   }
   app.post('/api/webhooks/slack', handleSlackWebhook)
   app.post('/api/slack/events', handleSlackWebhook)
@@ -194,6 +264,166 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   }
 
   return { app, chat }
+}
+
+async function handleSlackMessageHandoff(
+  thread: Thread<SlackbotV2ThreadState>,
+  message: ChatMessage,
+  input: {
+    assistantStatusRequested: boolean
+    mode: SlackbotV2MessageMode
+    options: SlackbotV2Options
+    state: StateAdapter
+    subscribe?: boolean
+    trigger: string
+  }
+): Promise<void> {
+  const trace = createHandoffTrace(thread, message, input.mode)
+  traceLog(input.options, 'slackbotv2_handoff_started', trace, {
+    assistant_status_requested: input.assistantStatusRequested,
+    subscribe: input.subscribe === true,
+    trigger: input.trigger
+  })
+  const assistantStatus = input.assistantStatusRequested
+    ? setInitialAssistantStatus(thread, input.options, trace)
+    : Promise.resolve(false)
+  try {
+    if (input.subscribe) {
+      await subscribeSlackThreadForHandoff(thread, input.options, trace, input.trigger)
+    }
+    const assistantStatusVisible = await assistantStatus
+    traceLog(input.options, 'slackbotv2_handoff_sync_starting', trace, {
+      initial_assistant_status_visible: assistantStatusVisible,
+      trigger: input.trigger
+    })
+    await syncThreadMessageToSession(thread, message, {
+      initialAssistantStatusVisible: assistantStatusVisible,
+      mode: input.mode,
+      options: input.options,
+      state: input.state
+    })
+    traceLog(input.options, 'slackbotv2_handoff_complete', trace, {
+      trigger: input.trigger
+    })
+  } catch (error) {
+    traceWarn(input.options, 'slackbotv2_handoff_failed', trace, {
+      error: errorMessage(error),
+      trigger: input.trigger
+    })
+    if (await assistantStatus) await setAssistantStatus(thread, '', input.options, trace)
+    throw error
+  }
+}
+
+async function subscribeSlackThreadForHandoff(
+  thread: Thread<SlackbotV2ThreadState>,
+  options: SlackbotV2Options,
+  trace: SlackbotV2Trace,
+  trigger: string
+): Promise<void> {
+  const startedAtMs = nowMs()
+  const fields = { trigger }
+  traceLog(options, 'slackbotv2_handoff_subscribe_started', trace, fields)
+  const stopPendingLog = startPendingOperationLog(
+    options,
+    'slackbotv2_handoff_subscribe_pending',
+    trace,
+    fields,
+    startedAtMs
+  )
+  try {
+    await thread.subscribe()
+    traceLog(options, 'slackbotv2_handoff_subscribe_complete', trace, {
+      ...fields,
+      phase_ms: elapsedMs(startedAtMs)
+    })
+  } catch (error) {
+    traceWarn(options, 'slackbotv2_handoff_subscribe_failed', trace, {
+      ...fields,
+      error: errorMessage(error),
+      phase_ms: elapsedMs(startedAtMs)
+    })
+    throw error
+  } finally {
+    stopPendingLog()
+  }
+}
+
+function createHandoffTrace(
+  thread: Thread<SlackbotV2ThreadState>,
+  message: ChatMessage,
+  mode: SlackbotV2MessageMode
+): SlackbotV2Trace {
+  return {
+    includeContext: mode === 'execute',
+    messageId: message.id,
+    mode,
+    openStream: mode === 'execute',
+    startedAtMs: nowMs(),
+    threadId: thread.id
+  }
+}
+
+function slackWebhookEventType(rawBody: string): string {
+  try {
+    const payload = JSON.parse(rawBody)
+    if (!isJsonObject(payload)) return 'unknown'
+    const event = payload.event
+    if (isJsonObject(event)) return stringValue(event.type) ?? 'unknown'
+    return stringValue(payload.type) ?? 'unknown'
+  } catch {
+    return 'invalid_json'
+  }
+}
+
+function recordForward(
+  mode: SlackbotV2MessageMode,
+  outcome: string,
+  startedAtMs: number
+): void {
+  slackbotMetrics.forwardMessages.inc({ mode, outcome })
+  slackbotMetrics.forwardDuration.observe({ mode, outcome }, observeSeconds(startedAtMs))
+}
+
+function recordRenderAttempt(source: string, outcome: string, startedAtMs: number): void {
+  slackbotMetrics.renderAttempts.inc({ outcome, source })
+  slackbotMetrics.renderAttemptDuration.observe({ outcome, source }, observeSeconds(startedAtMs))
+  if (outcome === 'complete' || outcome === 'fallback' || outcome === 'answer_visible') {
+    slackbotMetrics.lastSuccessfulRenderTimestamp.set(
+      { source },
+      Math.floor(Date.now() / 1000)
+    )
+  }
+}
+
+function recordRecoveryScan(
+  outcome: string,
+  startedAtMs: number,
+  counts: { deferred: number; indexedThreads: number; pending: number }
+): void {
+  slackbotMetrics.renderRecoveryScans.inc({ outcome })
+  slackbotMetrics.renderRecoveryScanDuration.observe({ outcome }, observeSeconds(startedAtMs))
+  slackbotMetrics.renderRecoveryObligations.set(
+    { state: 'indexed_threads' },
+    counts.indexedThreads
+  )
+  slackbotMetrics.renderRecoveryObligations.set({ state: 'pending' }, counts.pending)
+  slackbotMetrics.renderRecoveryObligations.set({ state: 'deferred' }, counts.deferred)
+}
+
+function recordRecoveryThreadEvent(event: string): void {
+  slackbotMetrics.renderRecoveryThreadEvents.inc({ event })
+}
+
+function recordFallback(outcome: string, startedAtMs: number): void {
+  slackbotMetrics.renderFallbacks.inc({ outcome })
+  slackbotMetrics.renderFallbackDuration.observe({ outcome }, observeSeconds(startedAtMs))
+  if (outcome === 'complete') {
+    slackbotMetrics.lastSuccessfulRenderTimestamp.set(
+      { source: 'fallback' },
+      Math.floor(Date.now() / 1000)
+    )
+  }
 }
 
 function createDefaultState(options: SlackbotV2Options, logger: Logger): StateAdapter {
@@ -294,6 +524,7 @@ async function syncThreadMessageToSession(
   thread: Thread<SlackbotV2ThreadState>,
   message: ChatMessage,
   input: {
+    initialAssistantStatusVisible?: boolean
     mode: SlackbotV2MessageMode
     options: SlackbotV2Options
     state: StateAdapter
@@ -320,21 +551,34 @@ async function syncThreadMessageToSession(
   }
   if (isDuplicateIncrementalMessage) {
     traceLog(input.options, 'slackbotv2_forward_duplicate_skipped', trace)
+    if (input.initialAssistantStatusVisible) {
+      await setAssistantStatus(thread, '', input.options, trace)
+    }
+    recordForward(input.mode, 'duplicate_skipped', traceStartedAtMs)
     return
   }
   traceLog(input.options, 'slackbotv2_forward_started', trace, {
     active_execution: state.activeExecution === true,
     history_forwarded: state.historyForwarded === true
   })
+  const assistantStatusVisible = shouldStartExecution
+    ? input.initialAssistantStatusVisible ??
+      (await setInitialAssistantStatus(thread, input.options, trace))
+    : false
+  if (!shouldStartExecution && input.initialAssistantStatusVisible) {
+    await setAssistantStatus(thread, '', input.options, trace)
+  }
 
   const serializeStartedAtMs = nowMs()
   const serializedMessage = await serializeMessage(message)
   const overrides = extractMessageOverrides(serializedMessage.text)
   serializedMessage.text = overrides.cleanedText
-  if (overrides.harnessType || overrides.model) {
+  if (overrides.harnessType || overrides.model || overrides.provider || overrides.reasoning) {
     traceLog(input.options, 'slackbotv2_forward_overrides_parsed', trace, {
       harness_type: overrides.harnessType,
-      model: overrides.model
+      model: overrides.model,
+      provider: overrides.provider,
+      reasoning: overrides.reasoning
     })
   }
   traceLog(input.options, 'slackbotv2_forward_message_serialized', trace, {
@@ -373,15 +617,30 @@ async function syncThreadMessageToSession(
     executeContextMessages:
       shouldStartExecution && shouldIncludeContext ? candidateMessages : undefined,
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
-    harnessType: overrides.harnessType,
+    // A harness override only applies when this message starts an execution;
+    // restarting the thread out from under an active execution would kill it.
+    harnessType: shouldStartExecution ? overrides.harnessType : undefined,
     messages: messagesToAppend,
     model: overrides.model,
+    provider: overrides.provider,
+    reasoning: overrides.reasoning,
     onEventId: eventId => {
       lastEventId = Math.max(lastEventId, eventId)
     },
     openStream: false,
     threadId: thread.id,
     trace
+  }
+
+  // The previous harness's conversation state dies with its sandbox on a
+  // restart, so re-feed the Slack thread transcript with this turn.
+  const handleSessionRestarted = async (): Promise<void> => {
+    const history = context ?? (await collectInitialContext(thread, message))
+    forwardInput.contextPreamble = harnessRestartPreamble(history, serializedMessage.id)
+    traceLog(input.options, 'slackbotv2_forward_restart_context_built', trace, {
+      history_message_count: history.length,
+      preamble_chars: forwardInput.contextPreamble?.length ?? 0
+    })
   }
 
   const commitMessagesAppended = async (): Promise<void> => {
@@ -461,9 +720,15 @@ async function syncThreadMessageToSession(
           })
         }
       }
+      recordForward(
+        input.mode,
+        isRetryableSessionApiError(error) ? 'retry_requested' : 'error',
+        traceStartedAtMs
+      )
       throw error
     }
     traceLog(input.options, 'slackbotv2_forward_complete', trace)
+    recordForward(input.mode, 'complete', traceStartedAtMs)
     return
   }
 
@@ -472,7 +737,8 @@ async function syncThreadMessageToSession(
     traceLog(input.options, 'slackbotv2_forward_active_execution_marked', trace)
     await forwardToSessionApi(input.options, forwardInput, {
       onExecutionStarted: commitExecutionStarted,
-      onMessagesAppended: commitMessagesAppended
+      onMessagesAppended: commitMessagesAppended,
+      onSessionRestarted: handleSessionRestarted
     })
     scheduleExecutionRender(
       thread,
@@ -481,11 +747,13 @@ async function syncThreadMessageToSession(
       forwardInput,
       () => lastEventId,
       renderLease,
+      assistantStatusVisible,
       trace
     )
     traceLog(input.options, 'slackbotv2_forward_complete', trace, {
       last_event_id: lastEventId
     })
+    recordForward(input.mode, 'complete', traceStartedAtMs)
   } catch (error) {
     // The live render is not happening; let the recovery sweep claim the
     // obligation (if one was committed) as soon as it scans.
@@ -509,11 +777,20 @@ async function syncThreadMessageToSession(
         traceLog(input.options, 'slackbotv2_webhook_retry_marked', trace, {
           error: errorMessage(error)
         })
+        if (assistantStatusVisible) await setAssistantStatus(thread, '', input.options, trace)
+        recordForward(input.mode, 'retry_requested', traceStartedAtMs)
         throw error
       }
     }
     try {
-      await renderExecutionStream(thread, streamError(error), serializedMessage, input.options, trace)
+      await renderExecutionStream(
+        thread,
+        streamError(error),
+        serializedMessage,
+        input.options,
+        trace,
+        assistantStatusVisible
+      )
     } catch (renderError) {
       // The error notice is best-effort; a Slack render failure here must not
       // mask the original forward failure.
@@ -525,6 +802,7 @@ async function syncThreadMessageToSession(
       latest_active_execution: latest.activeExecution === true,
       last_event_id: lastEventId
     })
+    recordForward(input.mode, 'error_notice_rendered', traceStartedAtMs)
   }
 }
 
@@ -535,9 +813,11 @@ function scheduleExecutionRender(
   input: ForwardSessionInput,
   getLastEventId: () => number,
   renderLease: { release: (() => Promise<void>) | null },
+  assistantStatusVisible: boolean,
   trace?: SlackbotV2Trace
 ): void {
   const promise = (async () => {
+    slackbotMetrics.activeLiveRenders.inc()
     try {
       let attempt = 0
       while (true) {
@@ -547,6 +827,7 @@ function scheduleExecutionRender(
           options,
           input,
           getLastEventId,
+          assistantStatusVisible,
           trace
         )
         if (result === 'complete') return
@@ -559,6 +840,7 @@ function scheduleExecutionRender(
         await sleep(delayMs)
       }
     } finally {
+      slackbotMetrics.activeLiveRenders.dec()
       await renderLease.release?.()
     }
   })()
@@ -571,21 +853,53 @@ async function renderExecutionAttempt(
   options: SlackbotV2Options,
   input: ForwardSessionInput,
   getLastEventId: () => number,
+  assistantStatusVisible: boolean,
   trace?: SlackbotV2Trace
 ): Promise<'complete' | 'retry'> {
+  const renderStartedAtMs = nowMs()
+  let outcome = 'failure'
   let rendered = false
   let retry = false
   let fallbackLastEventId = 0
   try {
-    await renderExecutionStream(
+    const streamResult = await renderExecutionStream(
       thread,
       streamSessionAfterHandoff(options, input),
       message,
       options,
-      trace
+      trace,
+      assistantStatusVisible
     )
     rendered = true
-    traceLog(options, 'slackbotv2_render_complete', trace)
+    outcome = 'complete'
+    let divergenceReconciled = false
+    if (streamResult.diverged && streamResult.messageId) {
+      // The live answer stream diverged from the recomposed answer, so the delta
+      // stream was frozen at the last clean prefix to avoid interleaving. Swap
+      // the (possibly truncated) streamed message for the durable, de-duplicated
+      // final answer so the user sees the complete response instead of a message
+      // that looks cut off. Reuses the final-answer fallback, which derives the
+      // answer from the terminal result rather than the doubled live buffer.
+      const reconciled = await renderFallbackFinalAnswer(
+        thread,
+        options,
+        {
+          afterEventId: input.afterEventId,
+          executionId: input.executionId,
+          threadId: input.threadId
+        },
+        trace,
+        { replaceMessageId: streamResult.messageId }
+      )
+      if (reconciled) {
+        divergenceReconciled = true
+        fallbackLastEventId = reconciled.lastEventId
+      }
+    }
+    traceLog(options, 'slackbotv2_render_complete', trace, {
+      answer_diverged: streamResult.diverged,
+      divergence_reconciled: divergenceReconciled
+    })
     return 'complete'
   } catch (error) {
     // Check the Slack adapter's delivery annotation before retryability:
@@ -595,10 +909,17 @@ async function renderExecutionAttempt(
     const answerLost = slackAnswerLost(error)
     if (answerLost === undefined && isRetryableSessionApiError(error)) {
       retry = true
-      traceLog(options, 'slackbotv2_render_deferred', trace, {
-        error: errorMessage(error),
-        last_event_id: getLastEventId()
-      })
+      outcome = 'retry'
+      traceLog(
+        options,
+        'slackbotv2_render_deferred',
+        trace,
+        {
+          error: errorMessage(error),
+          last_event_id: getLastEventId()
+        },
+        'warn'
+      )
       return 'retry'
     }
     if (answerLost === false) {
@@ -606,15 +927,49 @@ async function renderExecutionAttempt(
       // (for example a progress-card stop failed). Reposting would duplicate
       // the answer, so record the failure and finish.
       rendered = true
-      traceLog(options, 'slackbotv2_render_failed_answer_visible', trace, {
-        error: errorMessage(error)
-      })
+      outcome = 'answer_visible'
+      traceLog(
+        options,
+        'slackbotv2_render_failed_answer_visible',
+        trace,
+        {
+          error: errorMessage(error)
+        },
+        'warn'
+      )
       return 'complete'
     }
-    traceLog(options, 'slackbotv2_render_failed', trace, {
-      error: errorMessage(error),
-      slack_answer_lost: answerLost ?? 'unknown'
-    })
+    traceLog(
+      options,
+      'slackbotv2_render_failed',
+      trace,
+      {
+        error: errorMessage(error),
+        slack_answer_lost: answerLost ?? 'unknown'
+      },
+      'warn'
+    )
+    const replaceMessageId = isSlackStreamSizeLimitError(error)
+      ? slackStreamMessageId(error)
+      : undefined
+    if (isSlackStreamSizeLimitError(error) && !replaceMessageId) {
+      // Size-limit failures should be prevented by stream segmentation. If
+      // Slack still rejects a stream as too large but does not expose the
+      // failed stream message id, do not post a separate duplicate fallback.
+      rendered = true
+      outcome = 'size_limit_no_replacement'
+      traceLog(
+        options,
+        'slackbotv2_render_failed_size_limit_no_replacement',
+        trace,
+        {
+          error: errorMessage(error),
+          slack_answer_lost: answerLost ?? 'unknown'
+        },
+        'warn'
+      )
+      return 'complete'
+    }
     const fallback = await renderFallbackFinalAnswer(
       thread,
       options,
@@ -623,10 +978,12 @@ async function renderExecutionAttempt(
         executionId: input.executionId,
         threadId: input.threadId
       },
-      trace
+      trace,
+      replaceMessageId ? { replaceMessageId } : undefined
     )
     if (fallback) {
       rendered = true
+      outcome = 'fallback'
       fallbackLastEventId = fallback.lastEventId
       return 'complete'
     }
@@ -640,9 +997,11 @@ async function renderExecutionAttempt(
     })
     traceLog(options, 'slackbotv2_render_finalized', trace, {
       obligation_cleared: rendered,
+      render_duration_ms: elapsedMs(renderStartedAtMs),
       retry_scheduled: retry,
       last_event_id: getLastEventId()
     })
+    recordRenderAttempt('live', outcome, renderStartedAtMs)
   }
 }
 
@@ -656,6 +1015,29 @@ function slackAnswerLost(error: unknown): boolean | undefined {
   if (!error || typeof error !== 'object') return undefined
   const value = (error as { slackAnswerLost?: unknown }).slackAnswerLost
   return typeof value === 'boolean' ? value : undefined
+}
+
+function isSlackStreamSizeLimitError(error: unknown): boolean {
+  const code = slackStreamErrorCode(error)
+  return code.includes('msg_too_long') || code.includes('msg_blocks_too_long')
+}
+
+function slackStreamMessageId(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  const value = (error as { slackStreamMessageId?: unknown }).slackStreamMessageId
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function slackStreamErrorCode(error: unknown): string {
+  if (!error || typeof error !== 'object') return typeof error === 'string' ? error : ''
+  const record = error as Record<string, unknown>
+  if (typeof record.error === 'string') return record.error
+  const data = record.data
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    const dataError = (data as Record<string, unknown>).error
+    if (typeof dataError === 'string') return dataError
+  }
+  return typeof record.message === 'string' ? record.message : ''
 }
 
 const FALLBACK_OPEN_MAX_ATTEMPTS = 4
@@ -673,9 +1055,11 @@ async function renderFallbackFinalAnswer(
   thread: Thread,
   options: SlackbotV2Options,
   source: { afterEventId: number; executionId?: string; threadId: string },
-  trace?: SlackbotV2Trace
+  trace?: SlackbotV2Trace,
+  replacement?: { replaceMessageId: string }
 ): Promise<{ lastEventId: number } | null> {
   const startedAtMs = nowMs()
+  let outcome = 'error'
   let lastEventId = source.afterEventId
   try {
     let stream: AsyncIterable<SlackbotV2RendererSource> | undefined
@@ -712,27 +1096,42 @@ async function renderFallbackFinalAnswer(
     }
     const text = fallback.text()
     if (!text) {
+      outcome = 'empty'
       traceLog(options, 'slackbotv2_render_fallback_empty', trace, {
         last_event_id: lastEventId,
         phase_ms: elapsedMs(startedAtMs)
       })
       return null
     }
-    await thread.post(
-      truncateSlackText(text, SLACK_FALLBACK_TEXT_MAX_CHARS, 'Slack final answer')
-    )
+    const fallbackText = truncateSlackText(text, SLACK_FALLBACK_TEXT_MAX_CHARS, 'Slack final answer')
+    if (replacement) {
+      await thread.adapter.editMessage(thread.id, replacement.replaceMessageId, fallbackText)
+    } else {
+      await thread.post(fallbackText)
+    }
     traceLog(options, 'slackbotv2_render_fallback_complete', trace, {
       chars: text.length,
       last_event_id: lastEventId,
+      replacement_message_id: replacement?.replaceMessageId,
       phase_ms: elapsedMs(startedAtMs)
     })
+    outcome = 'complete'
     return { lastEventId }
   } catch (error) {
-    traceLog(options, 'slackbotv2_render_fallback_failed', trace, {
-      error: errorMessage(error),
-      phase_ms: elapsedMs(startedAtMs)
-    })
+    outcome = 'error'
+    traceLog(
+      options,
+      'slackbotv2_render_fallback_failed',
+      trace,
+      {
+        error: errorMessage(error),
+        phase_ms: elapsedMs(startedAtMs)
+      },
+      'error'
+    )
     return null
+  } finally {
+    recordFallback(outcome, startedAtMs)
   }
 }
 
@@ -762,16 +1161,23 @@ async function recoverRenderObligationsWithRetry(
       if (deferredCount === 0) return
       const delayMs = renderRetryDelayMs(attempt)
       attempt += 1
-      traceLog(options, 'slackbotv2_render_recovery_retry_scheduled', undefined, {
-        deferred_count: deferredCount,
-        retry_delay_ms: delayMs,
-        retry_attempt: attempt
-      })
+      recordRenderRecoveryRetry(options, { attempt, deferredCount, delayMs })
       await sleep(delayMs)
     } catch (error) {
-      traceLog(options, 'slackbotv2_render_recovery_failed', undefined, {
-        error: errorMessage(error)
+      recordRecoveryScan('error', nowMs(), {
+        deferred: 0,
+        indexedThreads: 0,
+        pending: 0
       })
+      traceLog(
+        options,
+        'slackbotv2_render_recovery_failed',
+        undefined,
+        {
+          error: errorMessage(error)
+        },
+        'error'
+      )
       return
     }
   }
@@ -788,8 +1194,16 @@ async function recoverRenderObligations(
   const indexedThreadIds = await state.getList<string>(RENDER_OBLIGATION_INDEX_KEY)
   const threadIds = Array.from(new Set(indexedThreadIds))
   const timeoutMs = options.renderRecoveryThreadTimeoutMs ?? RENDER_RECOVERY_THREAD_TIMEOUT_MS
+  let abandonedCount = 0
+  let activeObligationCount = 0
   let deferredCount = 0
+  let failedCount = 0
+  let leaseSkippedCount = 0
+  let resolvedCount = 0
+  let retryableDeferredCount = 0
+  let timedOutCount = 0
   traceLog(options, 'slackbotv2_render_recovery_scan', undefined, {
+    indexed_thread_count: threadIds.length,
     obligation_count: threadIds.length,
     phase_ms: elapsedMs(startedAtMs)
   })
@@ -800,15 +1214,25 @@ async function recoverRenderObligations(
       const threadState = await thread.state
       const obligation = threadState?.renderObligation
       if (!obligation) continue
+      activeObligationCount += 1
 
       // An obligation that keeps failing non-retryably (for example corrupt
       // state that can never address a Slack thread) must not poison the
       // retry loop forever: give up on it and unwedge the thread.
       if ((failureCounts.get(threadId) ?? 0) >= RENDER_RECOVERY_MAX_THREAD_FAILURES) {
-        traceLog(options, 'slackbotv2_render_recovery_abandoned', undefined, {
-          failure_count: failureCounts.get(threadId),
-          thread_id: threadId
-        })
+        abandonedCount += 1
+        recordRecoveryThreadEvent('abandoned')
+        traceLog(
+          options,
+          'slackbotv2_render_recovery_abandoned',
+          undefined,
+          {
+            ...renderObligationFields(obligation),
+            failure_count: failureCounts.get(threadId),
+            thread_id: threadId
+          },
+          'error'
+        )
         await thread.setState({
           activeExecution: false,
           lastEventId: threadState?.lastEventId ?? 0,
@@ -828,6 +1252,8 @@ async function recoverRenderObligations(
         // owns this thread. Count it as deferred so the retry loop keeps
         // running until the obligation is actually resolved.
         deferredCount += 1
+        leaseSkippedCount += 1
+        recordRecoveryThreadEvent('lease_skipped')
         traceLog(options, 'slackbotv2_render_recovery_lease_skipped', undefined, {
           thread_id: threadId
         })
@@ -857,33 +1283,74 @@ async function recoverRenderObligations(
       if (outcome.timedOut) {
         void recovery.catch(() => undefined)
         deferredCount += 1
+        timedOutCount += 1
         // Count timeouts toward the abandonment budget: an obligation whose
         // recovery hangs on every claim (for example an event stream that
         // never yields) would otherwise keep the sweep loop spinning forever,
         // racing every live render in the process.
         failureCounts.set(threadId, (failureCounts.get(threadId) ?? 0) + 1)
-        traceLog(options, 'slackbotv2_render_recovery_thread_timeout', undefined, {
-          failure_count: failureCounts.get(threadId),
-          thread_id: threadId,
-          timeout_ms: timeoutMs
-        })
+        recordRecoveryThreadEvent('timeout')
+        traceLog(
+          options,
+          'slackbotv2_render_recovery_thread_timeout',
+          undefined,
+          {
+            ...renderObligationFields(obligation),
+            failure_count: failureCounts.get(threadId),
+            thread_id: threadId,
+            timeout_ms: timeoutMs
+          },
+          'warn'
+        )
         continue
       }
       await releaseLease()
-      if (outcome.deferred) deferredCount += 1
+      if (outcome.deferred) {
+        deferredCount += 1
+        retryableDeferredCount += 1
+        recordRecoveryThreadEvent('deferred')
+      } else {
+        resolvedCount += 1
+        recordRecoveryThreadEvent('complete')
+      }
     } catch (error) {
       // One thread's corrupt state or failed render must not abort the scan:
       // log it, count it as deferred so a later pass retries it (up to the
       // failure budget above), and keep recovering the remaining threads.
       failureCounts.set(threadId, (failureCounts.get(threadId) ?? 0) + 1)
       deferredCount += 1
-      traceLog(options, 'slackbotv2_render_recovery_thread_failed', undefined, {
-        error: errorMessage(error),
-        failure_count: failureCounts.get(threadId),
-        thread_id: threadId
-      })
+      failedCount += 1
+      recordRecoveryThreadEvent('failed')
+      traceLog(
+        options,
+        'slackbotv2_render_recovery_thread_failed',
+        undefined,
+        {
+          error: errorMessage(error),
+          failure_count: failureCounts.get(threadId),
+          thread_id: threadId
+        },
+        'warn'
+      )
     }
   }
+  recordRenderRecoveryScan(options, {
+    abandonedCount,
+    activeObligationCount,
+    deferredCount,
+    failedCount,
+    indexedThreadCount: threadIds.length,
+    leaseSkippedCount,
+    phaseMs: elapsedMs(startedAtMs),
+    resolvedCount,
+    retryableDeferredCount,
+    timedOutCount
+  })
+  recordRecoveryScan(deferredCount > 0 ? 'deferred' : 'complete', startedAtMs, {
+    deferred: deferredCount,
+    indexedThreads: threadIds.length,
+    pending: activeObligationCount
+  })
   return deferredCount
 }
 
@@ -919,6 +1386,8 @@ async function recoverRenderObligation(
     threadId,
     trace
   }
+  const renderStartedAtMs = nowMs()
+  let renderOutcome = 'failure'
 
   let openedStream: AsyncIterable<SlackbotV2RendererSource>
   try {
@@ -930,13 +1399,19 @@ async function recoverRenderObligation(
       last_event_id: lastEventId,
       retryable
     })
-    if (retryable) return true
+    if (retryable) {
+      renderOutcome = 'deferred'
+      recordRenderAttempt('recovery', renderOutcome, renderStartedAtMs)
+      return true
+    }
     await renderRecoveredExecutionStream(thread, streamError(error), obligation.message, options, trace)
     await thread.setState({
       activeExecution: false,
       lastEventId,
       renderObligation: null
     })
+    renderOutcome = 'stream_error_rendered'
+    recordRenderAttempt('recovery', renderOutcome, renderStartedAtMs)
     return false
   }
 
@@ -946,7 +1421,7 @@ async function recoverRenderObligation(
       activeExecution: true,
       lastEventId
     })
-    await renderRecoveredExecutionStream(
+    const streamResult = await renderRecoveredExecutionStream(
       thread,
       streamOpenedSession(input, openedStream),
       obligation.message,
@@ -954,21 +1429,74 @@ async function recoverRenderObligation(
       trace
     )
     rendered = true
-    traceLog(options, 'slackbotv2_render_recovery_complete', trace)
+    renderOutcome = 'complete'
+    let divergenceReconciled = false
+    if (streamResult.diverged && streamResult.messageId) {
+      // Same divergence reconcile as the live path: the answer stream was
+      // frozen at the last clean prefix, so swap the streamed message for the
+      // durable, de-duplicated final answer instead of leaving it truncated.
+      const reconciled = await renderFallbackFinalAnswer(
+        thread,
+        options,
+        {
+          afterEventId: obligation.afterEventId,
+          executionId: obligation.executionId,
+          threadId
+        },
+        trace,
+        { replaceMessageId: streamResult.messageId }
+      )
+      if (reconciled) {
+        divergenceReconciled = true
+        lastEventId = Math.max(lastEventId, reconciled.lastEventId)
+      }
+    }
+    traceLog(options, 'slackbotv2_render_recovery_complete', trace, {
+      answer_diverged: streamResult.diverged,
+      divergence_reconciled: divergenceReconciled
+    })
   } catch (error) {
     const answerLost = slackAnswerLost(error)
     if (answerLost === false) {
       // The recovered stream broke only after the final answer became
       // visible; reposting would duplicate it.
       rendered = true
+      renderOutcome = 'answer_visible'
       traceLog(options, 'slackbotv2_render_recovery_failed_answer_visible', trace, {
         error: errorMessage(error)
       })
     } else {
-      traceLog(options, 'slackbotv2_render_recovery_render_failed', trace, {
-        error: errorMessage(error),
-        slack_answer_lost: answerLost ?? 'unknown'
-      })
+      traceLog(
+        options,
+        'slackbotv2_render_recovery_render_failed',
+        trace,
+        {
+          error: errorMessage(error),
+          slack_answer_lost: answerLost ?? 'unknown'
+        },
+        'warn'
+      )
+      const replaceMessageId = isSlackStreamSizeLimitError(error)
+        ? slackStreamMessageId(error)
+        : undefined
+      if (isSlackStreamSizeLimitError(error) && !replaceMessageId) {
+        // Size-limit failures should be prevented by stream segmentation. If
+        // Slack still rejects a stream as too large but does not expose the
+        // failed stream message id, do not post a separate duplicate fallback.
+        rendered = true
+        renderOutcome = 'size_limit_no_replacement'
+        traceLog(
+          options,
+          'slackbotv2_render_recovery_failed_size_limit_no_replacement',
+          trace,
+          {
+            error: errorMessage(error),
+            slack_answer_lost: answerLost ?? 'unknown'
+          },
+          'warn'
+        )
+        return false
+      }
       const fallback = await renderFallbackFinalAnswer(
         thread,
         options,
@@ -977,10 +1505,12 @@ async function recoverRenderObligation(
           executionId: obligation.executionId,
           threadId
         },
-        trace
+        trace,
+        replaceMessageId ? { replaceMessageId } : undefined
       )
       if (!fallback) throw error
       rendered = true
+      renderOutcome = 'fallback'
       lastEventId = Math.max(lastEventId, fallback.lastEventId)
     }
   } finally {
@@ -994,6 +1524,7 @@ async function recoverRenderObligation(
       obligation_cleared: rendered,
       last_event_id: lastEventId
     })
+    recordRenderAttempt('recovery', renderOutcome, renderStartedAtMs)
   }
   return false
 }
@@ -1010,6 +1541,7 @@ async function indexRenderObligation(
     maxLength: RENDER_OBLIGATION_INDEX_MAX_LENGTH,
     ttlMs: RENDER_INDEX_TTL_MS
   })
+  slackbotMetrics.renderObligationsIndexed.inc()
   traceLog(input.options, 'slackbotv2_render_obligation_indexed', input.trace)
 }
 
@@ -1022,6 +1554,61 @@ async function* streamOpenedSession(
 
 function renderRecoveryLeaseKey(threadId: string): string {
   return `slackbotv2:render:lease:${threadId}`
+}
+
+function recordRenderRecoveryRetry(
+  options: SlackbotV2Options,
+  observation: { attempt: number; deferredCount: number; delayMs: number }
+): void {
+  const fields = {
+    deferred_count: observation.deferredCount,
+    retry_delay_ms: observation.delayMs,
+    retry_attempt: observation.attempt
+  }
+  traceLog(options, 'slackbotv2_render_recovery_retry_scheduled', undefined, fields)
+}
+
+function recordRenderRecoveryScan(
+  options: SlackbotV2Options,
+  observation: {
+    abandonedCount: number
+    activeObligationCount: number
+    deferredCount: number
+    failedCount: number
+    indexedThreadCount: number
+    leaseSkippedCount: number
+    phaseMs: number
+    resolvedCount: number
+    retryableDeferredCount: number
+    timedOutCount: number
+  }
+): void {
+  const fields = {
+    abandoned_count: observation.abandonedCount,
+    active_obligation_count: observation.activeObligationCount,
+    deferred_count: observation.deferredCount,
+    failed_count: observation.failedCount,
+    indexed_thread_count: observation.indexedThreadCount,
+    lease_skipped_count: observation.leaseSkippedCount,
+    phase_ms: observation.phaseMs,
+    resolved_count: observation.resolvedCount,
+    retryable_deferred_count: observation.retryableDeferredCount,
+    timed_out_count: observation.timedOutCount
+  }
+  traceLog(options, 'slackbotv2_render_recovery_scan_complete', undefined, fields)
+}
+
+function renderObligationFields(obligation: SlackbotV2RenderObligation): JsonObject {
+  const messageTimestampMs = Date.parse(obligation.message.timestamp)
+  return {
+    after_event_id: obligation.afterEventId,
+    execution_id: obligation.executionId,
+    message_id: obligation.message.id,
+    message_timestamp: obligation.message.timestamp,
+    ...(Number.isFinite(messageTimestampMs)
+      ? { obligation_age_ms: Math.max(0, Date.now() - messageTimestampMs) }
+      : {})
+  }
 }
 
 /**
@@ -1063,18 +1650,30 @@ async function renderExecutionStream(
   stream: AsyncIterable<SlackbotV2RendererSource>,
   message: SlackbotV2ApiMessage,
   options: SlackbotV2Options,
-  trace?: SlackbotV2Trace
-): Promise<void> {
+  trace?: SlackbotV2Trace,
+  assistantStatusVisible = false
+): Promise<{ diverged: boolean; messageId?: string }> {
   if (isPlainTextOnlyRequest(message.text)) {
-    await renderPlainTextExecutionStream(thread, stream, message, options, trace)
-    return
+    await renderPlainTextExecutionStream(
+      thread,
+      stream,
+      message,
+      options,
+      trace,
+      assistantStatusVisible
+    )
+    return { diverged: false }
   }
   const titleStartedAtMs = nowMs()
   await setAssistantTitle(thread, titleFromMessage(message.text, options.userName))
-  await setAssistantStatus(thread, options.assistantStatus ?? 'Thinking...')
+  if (!assistantStatusVisible) {
+    await setAssistantStatus(thread, options.assistantStatus ?? 'Thinking...', options, trace)
+  }
   traceLog(options, 'slackbotv2_render_slack_metadata_set', trace, {
+    assistant_status_already_visible: assistantStatusVisible,
     phase_ms: elapsedMs(titleStartedAtMs)
   })
+  const capture = { diverged: false }
   const finalText = { text: '' }
   try {
     const visibleStream = await streamAfterFirstChunk(
@@ -1082,24 +1681,29 @@ async function renderExecutionStream(
         slackSafeChatSdkStream(
           codexAppServerToChatSdkStream(
             tapTerminalText(stream, finalText),
-            rendererOptions(thread, options)
+            rendererOptions(thread, options, capture)
           )
         )
       )
     )
     if (!visibleStream) {
       await maybePostQuickDeployCard(thread, finalText.text, options, trace)
-      return
+      return { diverged: false }
     }
-    await thread.post(
-      new StreamingPlan(
-        visibleStream,
-        { groupTasks: options.streamTaskDisplayMode ?? 'plan' }
-      )
-    )
+    // Stream via the adapter (as renderRecoveredExecutionStream does) so the
+    // posted message id is available for divergence reconciliation. For Slack
+    // this matches thread.post(StreamingPlan): updateIntervalMs is a no-op
+    // (Slack streams server-side) and the recipient context is the message
+    // author.
+    const sent = await thread.adapter.stream!(thread.id, visibleStream, {
+      recipientTeamId: message.teamId,
+      recipientUserId: message.author.userId,
+      taskDisplayMode: options.streamTaskDisplayMode ?? 'plan'
+    })
     await maybePostQuickDeployCard(thread, finalText.text, options, trace)
+    return { diverged: capture.diverged, messageId: sent?.id }
   } finally {
-    await setAssistantStatus(thread, '')
+    await setAssistantStatus(thread, '', options, trace)
   }
 }
 
@@ -1109,17 +1713,18 @@ async function renderRecoveredExecutionStream(
   message: SlackbotV2ApiMessage,
   options: SlackbotV2Options,
   trace?: SlackbotV2Trace
-): Promise<void> {
+): Promise<{ diverged: boolean; messageId?: string }> {
   if (isPlainTextOnlyRequest(message.text)) {
     await renderPlainTextExecutionStream(thread, stream, message, options, trace)
-    return
+    return { diverged: false }
   }
   const titleStartedAtMs = nowMs()
   await setAssistantTitle(thread, titleFromMessage(message.text, options.userName))
-  await setAssistantStatus(thread, options.assistantStatus ?? 'Thinking...')
+  await setAssistantStatus(thread, options.assistantStatus ?? 'Thinking...', options, trace)
   traceLog(options, 'slackbotv2_render_slack_metadata_set', trace, {
     phase_ms: elapsedMs(titleStartedAtMs)
   })
+  const capture = { diverged: false }
   const finalText = { text: '' }
   try {
     const visibleStream = await streamAfterFirstChunk(
@@ -1127,16 +1732,16 @@ async function renderRecoveredExecutionStream(
         slackSafeChatSdkStream(
           codexAppServerToChatSdkStream(
             tapTerminalText(stream, finalText),
-            rendererOptions(thread, options)
+            rendererOptions(thread, options, capture)
           )
         )
       )
     )
     if (!visibleStream) {
       await maybePostQuickDeployCard(thread, finalText.text, options, trace)
-      return
+      return { diverged: false }
     }
-    await thread.adapter.stream!(
+    const sent = await thread.adapter.stream!(
       thread.id,
       visibleStream,
       {
@@ -1146,8 +1751,9 @@ async function renderRecoveredExecutionStream(
       }
     )
     await maybePostQuickDeployCard(thread, finalText.text, options, trace)
+    return { diverged: capture.diverged, messageId: sent?.id }
   } finally {
-    await setAssistantStatus(thread, '')
+    await setAssistantStatus(thread, '', options, trace)
   }
 }
 
@@ -1156,13 +1762,17 @@ async function renderPlainTextExecutionStream(
   stream: AsyncIterable<SlackbotV2RendererSource>,
   message: SlackbotV2ApiMessage,
   options: SlackbotV2Options,
-  trace?: SlackbotV2Trace
+  trace?: SlackbotV2Trace,
+  assistantStatusVisible = false
 ): Promise<void> {
   const fallback = new SlackRenderFallback()
   const titleStartedAtMs = nowMs()
   await setAssistantTitle(thread, titleFromMessage(message.text, options.userName))
-  await setAssistantStatus(thread, options.assistantStatus ?? 'Thinking...')
+  if (!assistantStatusVisible) {
+    await setAssistantStatus(thread, options.assistantStatus ?? 'Thinking...', options, trace)
+  }
   traceLog(options, 'slackbotv2_render_plain_text_metadata_set', trace, {
+    assistant_status_already_visible: assistantStatusVisible,
     phase_ms: elapsedMs(titleStartedAtMs)
   })
   try {
@@ -1188,7 +1798,7 @@ async function renderPlainTextExecutionStream(
     await thread.post(text)
     await maybePostQuickDeployCard(thread, fallback.text(), options, trace)
   } finally {
-    await setAssistantStatus(thread, '')
+    await setAssistantStatus(thread, '', options, trace)
   }
 }
 
@@ -1410,6 +2020,32 @@ function shouldAwaitSlackHandoff(rawBody: string): boolean {
   }
 }
 
+function slackWebhookLogFields(rawBody: string): JsonObject {
+  try {
+    const payload = JSON.parse(rawBody) as Record<string, unknown>
+    const rawEvent = payload.event
+    const event =
+      rawEvent && typeof rawEvent === 'object' && !Array.isArray(rawEvent)
+        ? (rawEvent as Record<string, unknown>)
+        : {}
+    const fields: JsonObject = {}
+    setStringField(fields, 'slack_event_id', payload.event_id)
+    setStringField(fields, 'slack_event_type', event.type)
+    setStringField(fields, 'slack_channel', event.channel)
+    setStringField(fields, 'slack_message_ts', event.ts)
+    setStringField(fields, 'slack_thread_ts', event.thread_ts)
+    setStringField(fields, 'slack_team_id', payload.team_id || event.team)
+    return fields
+  } catch {
+    return { slack_payload_parse_error: true }
+  }
+}
+
+function setStringField(fields: JsonObject, key: string, value: unknown): void {
+  const text = stringField(value)
+  if (text) fields[key] = text
+}
+
 function isSlackThreadReply(message: ChatMessage): boolean {
   const raw = message.raw
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
@@ -1446,7 +2082,7 @@ async function collectSlackThreadContext(
       const messageTs = stringField(message.ts)
       if (!messageTs || compareSlackTs(messageTs, currentTs) > 0) continue
       if (isSelfSlackBotMessage(options, message)) continue
-      messages.push(slackApiMessageFromSlack(message, currentMessage))
+      messages.push(await slackApiMessageFromSlack(options, message, currentMessage))
     }
     cursor = response.nextCursor
   } while (cursor)
@@ -1461,16 +2097,17 @@ async function collectSlackThreadContext(
   return messages
 }
 
-function slackApiMessageFromSlack(
+async function slackApiMessageFromSlack(
+  options: SlackbotV2Options,
   message: Record<string, unknown>,
   currentMessage: ChatMessage
-): SlackbotV2ApiMessage {
+): Promise<SlackbotV2ApiMessage> {
   const rawCurrent = slackRawRecord(currentMessage)
   const id = stringField(message.ts) || randomUUID()
   const actorId = slackActorId(message)
   const isBot = Boolean(message.bot_id || message.bot_profile)
   return {
-    attachments: [],
+    attachments: await slackApiAttachmentsFromFiles(options, message, rawCurrent),
     author: {
       fullName: actorId,
       isBot,
@@ -1490,6 +2127,82 @@ function slackApiMessageFromSlack(
     threadId: currentMessage.threadId,
     timestamp: slackTimestampToIso(id)
   }
+}
+
+async function slackApiAttachmentsFromFiles(
+  options: SlackbotV2Options,
+  message: Record<string, unknown>,
+  rawCurrent: Record<string, unknown>
+): Promise<SlackbotV2ApiAttachment[]> {
+  const files = slackFiles(message)
+  if (files.length === 0) return []
+  const teamId =
+    stringField(message.team)
+    || stringField(message.team_id)
+    || stringField(rawCurrent.team)
+    || stringField(rawCurrent.team_id)
+  const attachments: SlackbotV2ApiAttachment[] = []
+  for (const file of files.slice(0, MAX_SLACK_MESSAGE_ATTACHMENTS)) {
+    attachments.push(await serializeAttachment(slackFileAttachment(options, file, teamId)))
+  }
+  if (files.length > MAX_SLACK_MESSAGE_ATTACHMENTS) {
+    attachments.push({
+      fetchError:
+        `only the first ${MAX_SLACK_MESSAGE_ATTACHMENTS} Slack message attachments were fetched`,
+      name: 'additional Slack thread attachments',
+      type: 'file'
+    })
+  }
+  return attachments
+}
+
+function slackFiles(message: Record<string, unknown>): Record<string, unknown>[] {
+  return Array.isArray(message.files)
+    ? (message.files.filter(file =>
+        file && typeof file === 'object' && !Array.isArray(file)
+      ) as Record<string, unknown>[])
+    : []
+}
+
+function slackFileAttachment(
+  options: SlackbotV2Options,
+  file: Record<string, unknown>,
+  teamId: string
+): Attachment {
+  const url = stringField(file.url_private_download) || stringField(file.url_private)
+  const mimeType = stringField(file.mimetype)
+  const fetchMetadata: Record<string, string> = {}
+  if (url) fetchMetadata.url = url
+  if (teamId) fetchMetadata.teamId = teamId
+  return {
+    fetchData: url ? () => fetchSlackFile(options, url) : undefined,
+    fetchMetadata: Object.keys(fetchMetadata).length > 0 ? fetchMetadata : undefined,
+    height: numberField(file.original_h),
+    mimeType,
+    name: stringField(file.name) || stringField(file.title) || stringField(file.id),
+    size: numberField(file.size),
+    type: slackFileAttachmentType(mimeType),
+    url,
+    width: numberField(file.original_w)
+  }
+}
+
+async function fetchSlackFile(options: SlackbotV2Options, url: string): Promise<Buffer> {
+  const fetchFn = options.fetch ?? fetch
+  const response = await fetchFn(url, {
+    headers: { authorization: `Bearer ${options.botToken}` }
+  })
+  if (!response.ok) {
+    throw new Error(`failed to fetch Slack file: ${response.status} ${response.statusText}`)
+  }
+  return Buffer.from(await response.arrayBuffer())
+}
+
+function slackFileAttachmentType(mimeType: string): Attachment['type'] {
+  if (mimeType.startsWith('image/')) return 'image'
+  if (mimeType.startsWith('video/')) return 'video'
+  if (mimeType.startsWith('audio/')) return 'audio'
+  return 'file'
 }
 
 function slackRawRecord(message: ChatMessage): Record<string, unknown> {
@@ -1525,6 +2238,10 @@ function stringField(value: unknown): string {
   return typeof value === 'string' ? value : ''
 }
 
+function numberField(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
 function compareSlackTs(a: string, b: string): number {
   const left = Number(a)
   const right = Number(b)
@@ -1554,10 +2271,33 @@ function normalizeSlackText(input: string): string {
     .trim()
 }
 
-function rendererOptions(thread: Thread, options: SlackbotV2Options): CodexAppServerToChatStreamOptions {
+// Surfaces the renderer's structured diagnostics (otherwise a no-op: nothing
+// wires logInfo), turns the answer-divergence guard into a Prometheus signal so
+// the real rate is measurable, and flips the per-render `capture.diverged` flag
+// so the caller can reconcile the message with the durable final answer.
+function rendererLogInfo(
+  options: SlackbotV2Options,
+  capture?: { diverged: boolean }
+): (event: string, fields: Record<string, unknown>) => void {
+  return (event, fields) => {
+    options.mapper?.logInfo?.(event, fields)
+    options.logger?.info(event, fields)
+    if (event === 'codex_renderer_stream_divergence_suppressed') {
+      slackbotMetrics.renderAnswerDivergence.inc()
+      if (capture) capture.diverged = true
+    }
+  }
+}
+
+function rendererOptions(
+  thread: Thread,
+  options: SlackbotV2Options,
+  capture?: { diverged: boolean }
+): CodexAppServerToChatStreamOptions {
   const mapper = options.mapper
   return {
     ...mapper,
+    logInfo: rendererLogInfo(options, capture),
     async onRendererEvent(event: RendererEvent) {
       await mapper?.onRendererEvent?.(event)
       if (event.type === 'renderer.title.update') {
@@ -1576,6 +2316,7 @@ function fallbackRendererOptions(options: SlackbotV2Options): CodexAppServerToCh
   const mapper = options.mapper
   return {
     ...mapper,
+    logInfo: rendererLogInfo(options),
     async onRendererEvent(event: RendererEvent) {
       try {
         await mapper?.onRendererEvent?.(event)
@@ -1594,18 +2335,89 @@ async function sleep(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms))
 }
 
-async function setAssistantStatus(thread: Thread, status: string): Promise<void> {
+async function setInitialAssistantStatus(
+  thread: Thread,
+  options: SlackbotV2Options,
+  trace?: SlackbotV2Trace
+): Promise<boolean> {
+  const startedAtMs = nowMs()
+  const visible = await setAssistantStatus(
+    thread,
+    options.assistantStatus ?? 'Thinking...',
+    options,
+    trace
+  )
+  traceLog(options, 'slackbotv2_forward_initial_status_set', trace, {
+    phase_ms: elapsedMs(startedAtMs),
+    visible
+  })
+  return visible
+}
+
+async function setAssistantStatus(
+  thread: Thread,
+  status: string,
+  options?: SlackbotV2Options,
+  trace?: SlackbotV2Trace
+): Promise<boolean> {
+  const startedAtMs = nowMs()
   const target = slackAssistantTarget(thread)
   const adapter = thread.adapter as SlackAssistantAdapter
-  if (!target || !adapter.setAssistantStatus) return
-  await ignoreAssistantError(() =>
-    adapter.setAssistantStatus!(
-      target.channel,
-      target.threadTs,
-      status,
-      status ? [status] : undefined
+  const fields = {
+    has_adapter: Boolean(adapter.setAssistantStatus),
+    has_target: Boolean(target),
+    operation: status ? 'set' : 'clear',
+    status_empty: !status
+  }
+  if (options) traceLog(options, 'slackbotv2_assistant_status_started', trace, fields)
+  if (!target || !adapter.setAssistantStatus) {
+    if (options) {
+      traceLog(options, 'slackbotv2_assistant_status_complete', trace, {
+        ...fields,
+        phase_ms: elapsedMs(startedAtMs),
+        visible: false
+      })
+    }
+    return false
+  }
+  const stopPendingLog = options
+    ? startPendingOperationLog(
+        options,
+        'slackbotv2_assistant_status_pending',
+        trace,
+        fields,
+        startedAtMs
+      )
+    : () => undefined
+  try {
+    const visible = await ignoreAssistantError(() =>
+      adapter.setAssistantStatus!(
+        target.channel,
+        target.threadTs,
+        status,
+        status ? [status] : undefined
+      )
     )
-  )
+    if (options) {
+      traceLog(options, 'slackbotv2_assistant_status_complete', trace, {
+        ...fields,
+        phase_ms: elapsedMs(startedAtMs),
+        visible
+      })
+    }
+    return visible
+  } catch (error) {
+    if (options) {
+      traceWarn(options, 'slackbotv2_assistant_status_failed', trace, {
+        ...fields,
+        error: errorMessage(error),
+        phase_ms: elapsedMs(startedAtMs)
+      })
+    }
+    throw error
+  } finally {
+    stopPendingLog()
+  }
 }
 
 async function setAssistantTitle(thread: Thread, title: string | undefined): Promise<void> {
@@ -1619,11 +2431,13 @@ async function setAssistantTitle(thread: Thread, title: string | undefined): Pro
   )
 }
 
-async function ignoreAssistantError(fn: () => Promise<void>): Promise<void> {
+async function ignoreAssistantError(fn: () => Promise<void>): Promise<boolean> {
   try {
     await fn()
+    return true
   } catch {
     // Assistant status/title are Slack UI polish. Rendering should continue if unsupported.
+    return false
   }
 }
 
