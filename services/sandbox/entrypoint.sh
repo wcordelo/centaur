@@ -139,6 +139,7 @@ fi
 HARNESS_CONFIG_DIR="${CENTAUR_HARNESS_CONFIG_DIR:-$HOME_DIR/harness}"
 if [ "${CODEX_USE_VLLM:-0}" = "1" ] || [ "${CODEX_MODEL_PROVIDER:-}" = "vllm" ]; then
     CODEX_USE_VLLM=1
+    export CODEX_MODEL_PROVIDER="${CODEX_MODEL_PROVIDER:-vllm}"
 else
     CODEX_USE_VLLM=0
 fi

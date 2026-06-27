@@ -76,6 +76,9 @@ pub struct AgentSandboxConfig {
     /// Only populated when api-rs validates CODEX_USE_VLLM=1 and an
     /// allowlisted VLLM_BASE_URL host (local dev gateways / loopback).
     pub host_egress_ports: Vec<u16>,
+    /// In-cluster LiteLLM reached directly (NO_PROXY + scoped egress). Plain
+    /// HTTP POST cannot be forwarded through iron-proxy's CONNECT tunnel.
+    pub litellm_egress: Option<LitellmEgressTarget>,
     pub ready_timeout: Duration,
 }
 
@@ -86,6 +89,14 @@ pub struct AgentSandboxConfig {
 pub struct OtlpEgressTarget {
     pub namespace: String,
     pub port: u16,
+}
+
+/// In-cluster LiteLLM the sandbox reaches directly (bypassing iron-proxy).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LitellmEgressTarget {
+    pub namespace: String,
+    pub port: u16,
+    pub no_proxy_hosts: Vec<String>,
 }
 
 /// iron-control coordinates for sync-mode egress proxies. When set, a sandbox
@@ -118,6 +129,7 @@ impl AgentSandboxConfig {
             tools: None,
             otlp_egress: None,
             host_egress_ports: Vec::new(),
+            litellm_egress: None,
             ready_timeout: Duration::from_secs(60),
         }
     }
@@ -323,7 +335,7 @@ impl SandboxBackend for AgentSandboxBackend {
         let mut spec = spec;
         let resolved_iron_proxy = self.resolve_iron_proxy(&id, &spec).await?;
         if let Some(resolved) = &resolved_iron_proxy {
-            iron_proxy::apply_proxy_env(&mut spec, resolved);
+            iron_proxy::apply_proxy_env(&mut spec, resolved, self.config.litellm_egress.as_ref());
         }
         if let Err(err) = self
             .create_iron_proxy_resources(&id, resolved_iron_proxy.as_ref())

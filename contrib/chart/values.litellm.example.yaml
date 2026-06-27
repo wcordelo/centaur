@@ -1,5 +1,8 @@
-# Example overlay: in-cluster LiteLLM as the Codex LLM gateway (all traffic
-# through iron-proxy — no NO_PROXY bypass for LiteLLM).
+# Example overlay: in-cluster LiteLLM as the Codex LLM gateway.
+#
+# Sandboxes reach LiteLLM directly (NO_PROXY + NetworkPolicy egress). iron-proxy
+# cannot forward plain HTTP to :4000 (CONNECT-only for HTTPS); api-rs injects the
+# real LITELLM_MASTER_KEY into sandbox VLLM_API_KEY at pod create time.
 #
 # Layer on top of values.local-slack.example.yaml:
 #   export CENTAUR_EXTRA_VALUES=contrib/chart/values.local-slack.example.yaml,contrib/chart/values.litellm.example.yaml
@@ -23,6 +26,7 @@ apiRs:
 sandbox:
   extraEnv:
     CODEX_USE_VLLM: "1"
+    CODEX_MODEL_PROVIDER: "vllm"
     VLLM_BASE_URL: http://centaur-centaur-litellm:4000/v1
     VLLM_API_KEY: LITELLM_API_KEY
-    CODEX_MODEL: openai/gpt-4o
+    CODEX_MODEL: openai/gpt-4o-mini

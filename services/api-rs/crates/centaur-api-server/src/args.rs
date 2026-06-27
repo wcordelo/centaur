@@ -22,7 +22,7 @@ use centaur_iron_proxy::{
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    OtlpEgressTarget, ToolSource, ToolsConfig,
+    LitellmEgressTarget, OtlpEgressTarget, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -1057,6 +1057,16 @@ impl SandboxArgs {
             }
         }
 
+        // In-cluster LiteLLM is reached directly (NO_PROXY); inject the real
+        // master key from this process env instead of the iron-proxy placeholder.
+        if self
+            .sandbox_litellm_egress_target(&self.iron_proxy.litellm.hosts)?
+            .is_some()
+            && let Some(key) = clean_optional_value(env::var("LITELLM_API_KEY").ok().as_deref())
+        {
+            upsert_env_pair(&mut envs, "VLLM_API_KEY", key);
+        }
+
         if let Some(root) = clean_optional_value(self.quick_local_root.as_deref()) {
             upsert_env_pair(&mut envs, "QUICK_LOCAL_ROOT", root);
         }
@@ -1204,6 +1214,38 @@ impl SandboxArgs {
              host-scoped). Dev-only; never deploy CODEX_USE_VLLM in production."
         );
         Ok(vec![port])
+    }
+
+    /// Scoped egress + NO_PROXY hosts for in-cluster LiteLLM (`VLLM_BASE_URL`
+    /// pointing at a configured LiteLLM service hostname). Plain HTTP cannot
+    /// traverse iron-proxy's CONNECT tunnel (405 Method Not Allowed).
+    fn sandbox_litellm_egress_target(
+        &self,
+        litellm_hosts: &[String],
+    ) -> Result<Option<LitellmEgressTarget>, ServerError> {
+        if !matches!(self.workload, SandboxWorkloadKind::CodexAppServer) {
+            return Ok(None);
+        }
+        let extra = self.sandbox_extra_env();
+        let use_vllm = extra
+            .iter()
+            .any(|(name, value)| name == "CODEX_USE_VLLM" && value.trim() == "1");
+        if !use_vllm {
+            return Ok(None);
+        }
+        let base_url = extra
+            .iter()
+            .find(|(name, _)| name == "VLLM_BASE_URL")
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty());
+        let Some(base_url) = base_url else {
+            return Ok(None);
+        };
+        Ok(parse_litellm_egress_target(
+            base_url,
+            litellm_hosts,
+            &self.k8s_namespace,
+        ))
     }
 
     fn workflow_host_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
@@ -1434,6 +1476,8 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         // OTLP endpoint env so there is a single source of truth.
         config.otlp_egress = args.sandbox_otlp_egress_target()?;
         config.host_egress_ports = args.sandbox_host_egress_ports()?;
+        config.litellm_egress =
+            args.sandbox_litellm_egress_target(&args.iron_proxy.litellm.hosts)?;
         // iron-control is the only proxy mode: a per-sandbox proxy syncs its
         // secrets from the control plane, so configuring iron-proxy without
         // iron-control would produce a non-functional proxy. Fail fast.
@@ -2068,6 +2112,56 @@ fn parse_vllm_base_url_host(base_url: &str) -> Option<String> {
 
 fn is_allowlisted_vllm_host(host: &str) -> bool {
     ALLOWLISTED_VLLM_HOSTS.contains(&host)
+}
+
+fn parse_litellm_egress_target(
+    base_url: &str,
+    configured_hosts: &[String],
+    deploy_namespace: &str,
+) -> Option<LitellmEgressTarget> {
+    let host = parse_vllm_base_url_host(base_url)?;
+    let port = parse_vllm_host_egress_port(base_url).unwrap_or(4000);
+    let normalized: Vec<String> = configured_hosts
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let host_matches = normalized.iter().any(|candidate| candidate == &host);
+    let namespace = if host_matches {
+        deploy_namespace.to_owned()
+    } else {
+        let labels: Vec<&str> = host.split('.').collect();
+        if labels.len() >= 3 && labels[2] == "svc" && !labels[0].is_empty() && !labels[1].is_empty()
+        {
+            labels[1].to_owned()
+        } else {
+            return None;
+        }
+    };
+    if !host_matches && !normalized.is_empty() {
+        let service_prefix = host.split('.').next().unwrap_or(&host);
+        if !normalized
+            .iter()
+            .any(|candidate| candidate == service_prefix || candidate.starts_with(service_prefix))
+        {
+            return None;
+        }
+    }
+    let mut no_proxy_hosts = vec![host.clone()];
+    if !host.contains('.') {
+        no_proxy_hosts.push(format!("{host}.{deploy_namespace}.svc"));
+        no_proxy_hosts.push(format!("{host}.{deploy_namespace}.svc.cluster.local"));
+    }
+    for candidate in normalized {
+        if !no_proxy_hosts.iter().any(|existing| existing == &candidate) {
+            no_proxy_hosts.push(candidate);
+        }
+    }
+    Some(LitellmEgressTarget {
+        namespace,
+        port,
+        no_proxy_hosts,
+    })
 }
 
 /// Port for host-reachable vLLM backends (e.g. `http://host.docker.internal:8000/v1`).

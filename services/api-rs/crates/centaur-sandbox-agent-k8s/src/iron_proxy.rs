@@ -20,7 +20,8 @@ use serde_json::{Value, json};
 use tokio::time::{Instant, sleep};
 
 use crate::{
-    AgentSandboxBackend, MANAGED_BY_LABEL, MANAGED_BY_VALUE, OtlpEgressTarget, SANDBOX_ID_LABEL,
+    AgentSandboxBackend, LitellmEgressTarget, MANAGED_BY_LABEL, MANAGED_BY_VALUE, OtlpEgressTarget,
+    SANDBOX_ID_LABEL,
     is_not_found, map_kube_error,
 };
 
@@ -316,6 +317,7 @@ impl AgentSandboxBackend {
             control_port,
             self.config.otlp_egress.as_ref(),
             &self.config.host_egress_ports,
+            self.config.litellm_egress.as_ref(),
         ) {
             self.network_policies()
                 .create(&PostParams::default(), &policy)
@@ -1021,7 +1023,11 @@ fn new_proxy_management_api_key() -> String {
     format!("mgmt-{}", uuid::Uuid::new_v4().simple())
 }
 
-pub(crate) fn apply_proxy_env(spec: &mut SandboxSpec, resolved: &ResolvedIronProxy) {
+pub(crate) fn apply_proxy_env(
+    spec: &mut SandboxSpec,
+    resolved: &ResolvedIronProxy,
+    litellm_egress: Option<&LitellmEgressTarget>,
+) {
     let mut no_proxy_extra = current_env_values(spec, ["NO_PROXY", "no_proxy"]);
     // The harness exports OTLP traces (usage/cost spans) straight to the
     // collector; routing them through iron-proxy fails (plain-HTTP forwards
@@ -1030,6 +1036,11 @@ pub(crate) fn apply_proxy_env(spec: &mut SandboxSpec, resolved: &ResolvedIronPro
     // Local vLLM backends (CODEX_USE_VLLM=1) must bypass iron-proxy even when
     // the operator did not duplicate the host in sandbox.extraEnv NO_PROXY.
     no_proxy_extra.extend(vllm_endpoint_hosts(spec));
+    // In-cluster LiteLLM is plain HTTP on :4000; iron-proxy's tunnel listener
+    // rejects absolute-URI forwards (405), so codex must reach it directly.
+    if let Some(target) = litellm_egress {
+        no_proxy_extra.extend(target.no_proxy_hosts.iter().cloned());
+    }
     let api_host = env_value(spec, "CENTAUR_API_URL").and_then(host_from_url);
     for (name, value) in proxy_env(
         &resolved.proxy_host,
@@ -1268,6 +1279,7 @@ fn build_iron_proxy_network_policies(
     control_port: u16,
     otlp_egress: Option<&OtlpEgressTarget>,
     host_egress_ports: &[u16],
+    litellm_egress: Option<&LitellmEgressTarget>,
 ) -> Vec<NetworkPolicy> {
     let sandbox_to_proxy_ports = sandbox_to_proxy_ports(resolved);
     let mut sandbox_egress = vec![
@@ -1297,6 +1309,12 @@ fn build_iron_proxy_network_policies(
             ports: Some(vec![network_port(*port)]),
             ..Default::default()
         });
+    }
+    if let Some(target) = litellm_egress {
+        sandbox_egress.push(egress_to(
+            vec![namespace_peer(&target.namespace)],
+            vec![network_port(target.port)],
+        ));
     }
     vec![
         NetworkPolicy {
@@ -1896,6 +1914,7 @@ mod tests {
             3000,
             Some(&target),
             &[],
+            None,
         );
         let sandbox_egress = policies[0]
             .spec
@@ -1912,7 +1931,7 @@ mod tests {
         );
 
         let policies =
-            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None, &[]);
+            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None, &[], None);
         let sandbox_egress = policies[0]
             .spec
             .as_ref()
@@ -1973,7 +1992,7 @@ mod tests {
         let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
 
         let policies =
-            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None, &[]);
+            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None, &[], None);
         let ingress = policies[1]
             .spec
             .as_ref()
@@ -2234,7 +2253,7 @@ mod tests {
         let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
 
         let policies =
-            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None, &[8000]);
+            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None, &[8000], None);
         let sandbox_egress = policies[0]
             .spec
             .as_ref()
@@ -2272,7 +2291,7 @@ mod tests {
             "http://laminar-app-server.laminar.svc.cluster.local:8000/v1/traces",
         );
 
-        apply_proxy_env(&mut spec, &resolved());
+        apply_proxy_env(&mut spec, &resolved(), None);
 
         for name in ["NO_PROXY", "no_proxy"] {
             let value = spec
@@ -2296,7 +2315,7 @@ mod tests {
             .env("CODEX_USE_VLLM", "1")
             .env("VLLM_BASE_URL", "http://host.docker.internal:8000/v1");
 
-        apply_proxy_env(&mut spec, &resolved());
+        apply_proxy_env(&mut spec, &resolved(), None);
 
         for name in ["NO_PROXY", "no_proxy"] {
             let value = spec
@@ -2318,7 +2337,7 @@ mod tests {
             .env("CODEX_USE_VLLM", "1")
             .env("VLLM_BASE_URL", "http://vllm.prod.example.com:8000/v1");
 
-        apply_proxy_env(&mut spec, &resolved());
+        apply_proxy_env(&mut spec, &resolved(), None);
 
         let value = spec
             .env

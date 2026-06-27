@@ -153,6 +153,8 @@ curl -sS http://127.0.0.1:3002/health
 
 ## 5. Expose Slackbot With Tailscale Funnel
 
+Enable **Funnel** and **HTTPS certificates** in the [Tailscale admin DNS page](https://login.tailscale.com/admin/dns) first. If the CLI prints an enable URL, open it once per machine.
+
 ```bash
 tailscale funnel --bg --yes 3002
 tailscale funnel status

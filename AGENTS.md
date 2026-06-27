@@ -97,7 +97,7 @@ clients (see [API Key Management](#api-key-management)).
 
 ### Local Slack on kind / laptop clusters
 
-For `@bot` mentions through a Cloudflare (or other) tunnel, see [docs/public/md/local-slack-dev.md](docs/public/md/local-slack-dev.md). Use `contrib/chart/values.local-slack.example.yaml` with `CENTAUR_EXTRA_VALUES` (slackbot v2 + api-rs; default LLM is OpenAI via `OPENAI_API_KEY` in `.env`). Optional local vLLM + Gemma 4 requires `CODEX_USE_VLLM=1` in overlay `sandbox.extraEnv` and api-rs host-egress NetworkPolicy support — see [docs/public/md/local-model-development.md](docs/public/md/local-model-development.md) and the Slack doc’s operational notes.
+For `@bot` mentions through a Cloudflare (or other) tunnel, see [docs/public/md/local-slack-dev.md](docs/public/md/local-slack-dev.md). Use `contrib/chart/values.local-slack.example.yaml` with `CENTAUR_EXTRA_VALUES` (slackbot v2 + api-rs; default LLM is OpenAI via `OPENAI_API_KEY` in `.env`). For **in-cluster LiteLLM** (OpenAI key only on the LiteLLM pod, Codex via `modelProvider=vllm`), add `contrib/chart/values.litellm.example.yaml` — see [docs/public/md/deploy-litellm-mac.md](docs/public/md/deploy-litellm-mac.md). Optional **host** vLLM + Gemma 4 requires `CODEX_USE_VLLM=1` in overlay `sandbox.extraEnv` and api-rs host-egress NetworkPolicy support — see [docs/public/md/local-model-development.md](docs/public/md/local-model-development.md).
 
 ## Architecture
 

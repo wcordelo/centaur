@@ -506,8 +506,8 @@ containerSecurityContext:
 litellm:
   enabled: false
   image:
-    repository: ghcr.io/berriai/litellm
-    tag: v1.88.5-stable
+    repository: centaur-litellm
+    tag: v1.88.5
     pullPolicy: IfNotPresent
   service:
     port: 4000

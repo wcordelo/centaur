@@ -337,7 +337,7 @@ Summary of what the local Slack stack expects — useful when picking this up ag
 |-------|----------------|
 | **Overlay** | `contrib/chart/values.local-slack.example.yaml` — slackbotv2 + api-rs, v1 slackbot/api disabled, iron-control on arm64 |
 | **Secrets** | `.env` → `contrib/scripts/sync-local-env.sh` → `centaur-infra-env` (includes `OPENAI_API_KEY`, Slack tokens, `SLACKBOT_API_KEY`) |
-| **LLM** | Default OpenAI via iron-proxy; optional vLLM needs `CODEX_USE_VLLM=1` + allowlisted `VLLM_BASE_URL` |
+| **LLM** | Default OpenAI via iron-proxy; **in-cluster LiteLLM** overlay: [deploy-litellm-mac.md](deploy-litellm-mac.md); host vLLM needs `CODEX_USE_VLLM=1` + allowlisted `VLLM_BASE_URL` |
 | **NetworkPolicy** | api-rs opens a **dev-only** egress hole on the vLLM TCP port when vLLM env is validated (`host.docker.internal`, etc. only); port-scoped, not host-scoped — never enable in prod |
 | **Sandboxes** | One `asbx-*` pod per Slack thread; config is fixed at create time — recycle pods after overlay/api-rs/agent image changes |
 | **Tunnel** | `contrib/scripts/dev-slack-tunnel.sh` → Cloudflare URL → Slack Event Subscriptions Request URL `/api/webhooks/slack` |
@@ -352,4 +352,5 @@ Code touched for vLLM host egress (when experimenting locally):
 
 - [Quickstart — Slack app setup](/quickstart)
 - [mac-mini-setup](/mac-mini-setup)
+- [Deploy with in-cluster LiteLLM](deploy-litellm-mac.md)
 - [Tailscale Funnel](/operate/tailscale-funnel)
