@@ -22,7 +22,37 @@ export SLACKBOT_API_KEY=...
 
 Application-level LLM/tool secrets such as OpenAI and Anthropic tokens stay in 1Password and are loaded by the secrets service.
 
-### 2. Boot the stack
+### 2. Sync from upstream (fork workflow)
+
+This checkout is a fork of [`paradigmxyz/centaur`](https://github.com/paradigmxyz/centaur).
+`origin` points at the fork; upstream is the canonical open-source repo. At the start
+of a new agent session (or before picking up stale work), sync local `main` with
+upstream and push the result back to the fork so `origin/main` stays current.
+
+```bash
+just sync-upstream          # fetch + merge upstream/main (adds upstream remote if needed)
+git push origin main        # publish the merge to the fork
+```
+
+The script lives at `contrib/scripts/sync-upstream.sh`. It requires a clean working
+tree and refuses to run with uncommitted changes.
+
+Useful flags:
+
+```bash
+just sync-upstream --fetch-only   # fetch only; no merge
+just sync-upstream --rebase       # rebase onto upstream instead of merge
+just sync-upstream --dry-run      # preview commands
+```
+
+Override defaults with `CENTAUR_UPSTREAM_URL`, `CENTAUR_UPSTREAM_REMOTE`, or
+`CENTAUR_UPSTREAM_BRANCH` when needed.
+
+If the merge conflicts, resolve files, commit the merge, then push. Common overlap
+with fork-only customizations includes `services/slackbotv2/src/server.ts` and
+sandbox network-policy tests in `centaur-sandbox-agent-k8s`.
+
+### 3. Boot the stack
 
 ```bash
 just up
@@ -37,7 +67,7 @@ embedded migrator. The api-rs binary applies those migrations on startup when
 the chart enables migration running, and the Rust tests use the same migration
 set for database-backed coverage.
 
-### 3. Test
+### 4. Test
 
 From inside the API deployment (localhost bypass — no key needed):
 
@@ -836,6 +866,23 @@ This section is for Cursor Cloud agents. The Cloud VM has **no Docker, Kubernete
 above does not apply here. The live code is Rust (`services/api-rs`), Bun/TS
 (`services/slackbotv2`, `packages/*`), and Python tools (`tools/`, `centaur_sdk`) —
 parts of this guide that describe a Python FastAPI control plane are historical.
+
+### Sync from upstream at session start
+
+This repo is a fork of `paradigmxyz/centaur`. When the user asks to sync upstream
+or start work on a stale branch, run the standard git workflow (Cloud VMs have
+`git` but not `just`):
+
+```bash
+git remote get-url upstream 2>/dev/null || git remote add upstream https://github.com/paradigmxyz/centaur.git
+git fetch upstream main
+git merge --no-edit upstream/main   # or: contrib/scripts/sync-upstream.sh when just is available
+git push origin main
+```
+
+Resolve merge conflicts, commit, and push. Prefer keeping fork-only options (e.g.
+`quickBaseDomain` in slackbotv2) alongside upstream additions rather than
+dropping either side.
 
 ### Preinstalled in the VM snapshot (do not reinstall)
 - Rust stable via `rustup` (default toolchain; needed for edition 2024), `uv`, `bun`,

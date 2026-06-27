@@ -14,6 +14,7 @@ Use this when the user asks to run Centaur locally end-to-end with the Rust API,
 - Prefer onepassword/iron-proxy for model/tool credentials. Do not pass real LLM keys into sandbox env unless the user explicitly asks for a shortcut.
 - Never print secret values. Use `op read`/`op item get` into env vars and only log which secret names were used.
 - Before branch changes or cleanup, check `git status --short --branch` and preserve unrelated dirty files.
+- This checkout is a fork of `paradigmxyz/centaur`. At the start of a session, or when the user asks to sync upstream, run `just sync-upstream` then `git push origin main` so the fork stays current. See [Sync from upstream](../../AGENTS.md#2-sync-from-upstream-fork-workflow) in `AGENTS.md`.
 
 ## Prereqs
 

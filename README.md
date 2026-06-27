@@ -112,6 +112,14 @@ git clone <repo-url>
 cd centaur
 ```
 
+This fork tracks [`paradigmxyz/centaur`](https://github.com/paradigmxyz/centaur).
+To pull the latest upstream changes and publish them to your fork:
+
+```bash
+just sync-upstream
+git push origin main
+```
+
 Install the local command runner:
 
 ```bash
