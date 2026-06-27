@@ -70,6 +70,16 @@ Optional iron-control bootstrap (consumed when ironControl.enabled=true):
                                initial admin email (default admin@centaur.local)
   The initial password, API key, the three ActiveRecord encryption keys, and
   SECRET_KEY_BASE are auto-generated when absent (never rotated in place).
+
+Optional LiteLLM in-cluster bootstrap (consumed when litellm.enabled=true):
+  LITELLM_MASTER_KEY          virtual key iron-proxy injects for LiteLLM; also
+                              LiteLLM pod LITELLM_MASTER_KEY. Auto-generated when
+                              absent. Patched into centaur-infra-env as
+                              LITELLM_API_KEY for iron-control proxy injection.
+  OPENAI_API_KEY              real provider key — written to centaur-litellm-env
+                              only (not centaur-infra-env). Required when
+                              LITELLM_MASTER_KEY is set.
+
 EOF
 }
 
@@ -328,6 +338,38 @@ else
   fi
   kubectl "${secret_args[@]}" >/dev/null
   echo "Created Secret centaur-infra-env in namespace $NAMESPACE"
+fi
+
+# LiteLLM provider + virtual key secrets (litellm.enabled overlay).
+if [[ -n "${LITELLM_MASTER_KEY:-}" || -n "${OPENAI_API_KEY:-}" ]]; then
+  if [[ -z "${LITELLM_MASTER_KEY:-}" ]]; then
+    LITELLM_MASTER_KEY="$(rand_hex)"
+    echo "Generated LITELLM_MASTER_KEY"
+  fi
+  if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+    echo "FATAL: OPENAI_API_KEY is required when bootstrapping LiteLLM (centaur-litellm-env)" >&2
+    exit 1
+  fi
+  litellm_args=(
+    -n "$NAMESPACE" create secret generic centaur-litellm-env
+    --from-literal=LITELLM_MASTER_KEY="$LITELLM_MASTER_KEY"
+    --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY"
+  )
+  if secret_exists centaur-litellm-env; then
+    if [[ "$FORCE" == "1" ]]; then
+      kubectl -n "$NAMESPACE" delete secret centaur-litellm-env --ignore-not-found >/dev/null
+      kubectl "${litellm_args[@]}" >/dev/null
+      echo "Recreated Secret centaur-litellm-env in namespace $NAMESPACE"
+    else
+      echo "Secret centaur-litellm-env already exists in namespace $NAMESPACE; leaving unchanged"
+    fi
+  else
+    kubectl "${litellm_args[@]}" >/dev/null
+    echo "Created Secret centaur-litellm-env in namespace $NAMESPACE"
+  fi
+  patch_json="$(printf '{"data":{"LITELLM_API_KEY":"%s"}}' "$(printf '%s' "$LITELLM_MASTER_KEY" | base64 | tr -d '\n')")"
+  kubectl -n "$NAMESPACE" patch secret centaur-infra-env --type merge -p "$patch_json" >/dev/null
+  echo "Patched LITELLM_API_KEY into centaur-infra-env for iron-proxy injection"
 fi
 
 if secret_exists centaur-firewall-ca && secret_exists centaur-firewall-ca-key; then

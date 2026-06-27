@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.centaur.kind-up</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>$HOME/Documents/centaur/contrib/scripts/macos/centaur-kind-up.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/centaur-kind-up.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/centaur-kind-up.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>CENTAUR_REPO</key>
+    <string>$HOME/Documents/centaur</string>
+    <key>CENTAUR_EXTRA_VALUES</key>
+    <string>contrib/chart/values.local-slack.example.yaml,contrib/chart/values.litellm.example.yaml,contrib/chart/values.tailscale-funnel.example.yaml</string>
+  </dict>
+</dict>
+</plist>

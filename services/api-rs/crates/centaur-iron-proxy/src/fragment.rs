@@ -170,6 +170,40 @@ transforms:
           rules: [{ host: api.openai.com }]
 "#;
 
+/// iron-proxy credential injection for in-cluster LiteLLM. Sandboxes send the
+/// placeholder `LITELLM_API_KEY` in `Authorization`; iron-control resolves the
+/// real `LITELLM_MASTER_KEY` from the deployment secret backend.
+pub fn litellm_auth_fragment(hosts: &[String]) -> Result<Option<ProxyFragment>> {
+    if hosts.is_empty() {
+        return Ok(None);
+    }
+    let mut rules = String::from("          rules:\n");
+    for host in hosts {
+        let host = host.trim();
+        if host.is_empty() {
+            continue;
+        }
+        rules.push_str(&format!("            - {{ host: {host} }}\n"));
+    }
+    if !rules.contains("{ host:") {
+        return Ok(None);
+    }
+    let yaml = format!(
+        r#"transforms:
+  - name: secrets
+    config:
+      secrets:
+        - id: LITELLM_API_KEY_AUTHORIZATION
+          source:
+            placeholder: LITELLM_API_KEY
+          inject:
+            header: Authorization
+            formatter: "Bearer {{.Value}}"
+{rules}"#
+    );
+    load_fragment_str(&yaml).map(Some)
+}
+
 const OPENROUTER_API_KEY_FRAGMENT: &str = r#"
 transforms:
   - name: secrets

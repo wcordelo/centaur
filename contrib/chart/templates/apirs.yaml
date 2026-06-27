@@ -268,6 +268,12 @@ spec:
             # with the harness the sandbox image CMD actually runs.
             - name: KUBERNETES_IRON_PROXY_HARNESS_ENGINE
               value: {{ .Values.sandbox.harnessEngine | quote }}
+{{- if .Values.litellm.enabled }}
+            - name: KUBERNETES_IRON_PROXY_LITELLM_HOSTS
+              value: {{ include "centaur.litellmHosts" . | quote }}
+            - name: KUBERNETES_IRON_PROXY_ADDITIONAL_EGRESS_PORTS
+              value: {{ .Values.litellm.service.port | quote }}
+{{- end }}
 {{- $sandboxEnvList := list }}
 {{- if and .Values.repoCache.enabled (gt (len $skillDirs) 0) }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_SKILL_DIRS" "value" (join ":" $skillDirs)) }}

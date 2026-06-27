@@ -19,6 +19,11 @@ fn harness_auth_fragments_are_baked_in() {
 
     assert!(harness_auth_fragment("codex", "bogus").unwrap().is_none());
 
+    let litellm = litellm_auth_fragment(&["centaur-centaur-litellm".to_owned()])
+        .unwrap()
+        .unwrap();
+    assert!(placeholder_env(&[litellm]).is_empty());
+
     let infra = infra_fragment().unwrap();
     assert_eq!(
         infra.top_level["proxy"]["upstream_response_header_timeout"].as_str(),

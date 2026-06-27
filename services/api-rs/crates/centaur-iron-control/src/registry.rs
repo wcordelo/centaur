@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use centaur_iron_proxy::{
     PgDsnSetting, PgDsnSettingValueFrom, PostgresListener, ProxyFragment, Secret, SecretReplace,
-    SourceKind, SourcePolicy, pg_foreign_id,
+    SourceKind, SourcePolicy, litellm_auth_fragment, pg_foreign_id,
 };
 use serde_json::{Value as JsonValue, json};
 use serde_yaml::Value as YamlValue;
@@ -1074,6 +1074,23 @@ transforms:
         // Identity comes from the placeholder (the actual secret), not the header.
         assert_eq!(input.foreign_id, "tool-codex-openai-codex-account-id");
         assert_eq!(input.name, "OPENAI_CODEX_ACCOUNT_ID");
+    }
+
+    #[test]
+    fn litellm_inject_secret_derives_source() {
+        let fragment = litellm_auth_fragment(&["centaur-centaur-litellm".to_owned()])
+            .unwrap()
+            .unwrap();
+        let inputs =
+            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap();
+        assert_eq!(inputs.len(), 1);
+        let SecretInput::Static(input) = &inputs[0] else {
+            panic!("expected a static secret");
+        };
+        assert_eq!(input.name, "LITELLM_API_KEY");
+        assert_eq!(input.source.config, json!({ "var": "LITELLM_API_KEY" }));
+        assert_eq!(input.rules.len(), 1);
+        assert_eq!(input.rules[0].host.as_deref(), Some("centaur-centaur-litellm"));
     }
 
     #[test]

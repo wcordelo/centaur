@@ -1,0 +1,28 @@
+# Example overlay: in-cluster LiteLLM as the Codex LLM gateway (all traffic
+# through iron-proxy — no NO_PROXY bypass for LiteLLM).
+#
+# Layer on top of values.local-slack.example.yaml:
+#   export CENTAUR_EXTRA_VALUES=contrib/chart/values.local-slack.example.yaml,contrib/chart/values.litellm.example.yaml
+#   just up
+#
+# Prerequisites:
+#   export LITELLM_MASTER_KEY="$(openssl rand -hex 32)"
+#   export OPENAI_API_KEY=sk-...   # real key — LiteLLM pod only (see bootstrap)
+#   just bootstrap-secrets
+#
+# Do NOT put OPENAI_API_KEY in centaur-infra-env via sync-local-env.sh on this
+# path; bootstrap writes provider keys to centaur-litellm-env only.
+
+litellm:
+  enabled: true
+
+apiRs:
+  # Warm sandboxes reserve ~4GB each; keep at 0 on a laptop, 0–1 on Mac Studio.
+  sandboxWarmPoolSize: 0
+
+sandbox:
+  extraEnv:
+    CODEX_USE_VLLM: "1"
+    VLLM_BASE_URL: http://centaur-centaur-litellm:4000/v1
+    VLLM_API_KEY: LITELLM_API_KEY
+    CODEX_MODEL: openai/gpt-4o

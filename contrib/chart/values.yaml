@@ -501,6 +501,20 @@ containerSecurityContext:
     drop:
       - ALL
 
+# In-cluster LiteLLM gateway for Codex (private ClusterIP; real provider keys only
+# on the LiteLLM pod). Enable with values.litellm.example.yaml overlay.
+litellm:
+  enabled: false
+  image:
+    repository: ghcr.io/berriai/litellm
+    tag: v1.88.5-stable
+    pullPolicy: IfNotPresent
+  service:
+    port: 4000
+  # Secret holding OPENAI_API_KEY and LITELLM_MASTER_KEY (created by bootstrap).
+  existingSecretName: centaur-litellm-env
+  resources: {}
+
 # Quick — wildcard static serving for agent-deployed artifacts (off by default).
 # Pair with the `quick` tool: agents deploy via deploy_artifact; this module
 # serves the result at https://<site_id>.<baseDomain>. Auth is enforced by the

@@ -42,8 +42,10 @@ ironControl:
 #   kind load docker-image centaur-agent:latest --name centaur
 #
 # LLM backend (pick one):
-#   A) OpenAI (default below) — set OPENAI_API_KEY in .env, run sync-local-env.sh.
-#   B) Local Gemma via vLLM — uncomment extraEnv block; start vLLM on :8000.
+#   A) OpenAI direct (default below) — set OPENAI_API_KEY in .env, run sync-local-env.sh.
+#   B) In-cluster LiteLLM (recommended for Mac deploy) — use values.litellm.example.yaml;
+#      see docs/public/md/deploy-litellm-mac.md.
+#   C) Local Gemma via vLLM — uncomment extraEnv block; start vLLM on :8000.
 #      Gemma 4 E2B emits Codex <|channel> control tokens; Slack replies are broken
 #      until we add stripping or use a non-E2B checkpoint. Dev-only egress hole.
 sandbox:

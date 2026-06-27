@@ -18,6 +18,7 @@ use centaur_iron_control::{
 };
 use centaur_iron_proxy::{
     ProxyFragment, SourceKind, SourcePolicy, bedrock_enabled, harness_auth_fragment, infra_fragment,
+    litellm_auth_fragment,
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
@@ -1624,6 +1625,8 @@ struct IronProxyArgs {
     source: IronProxySourceArgs,
     #[command(flatten)]
     harness: IronProxyHarnessArgs,
+    #[command(flatten)]
+    litellm: IronProxyLitellmArgs,
     #[arg(
         long = "kubernetes-secret-env-name",
         env = "KUBERNETES_SECRET_ENV_NAME"
@@ -1655,8 +1658,13 @@ impl IronProxyArgs {
             IronProxyConfig::new(self.image.clone(), ca_cert_secret_name, ca_key_secret_name);
         config.image_pull_policy = self.image_pull_policy.clone();
         self.source.apply_to_config(&mut config);
-        config.fragments = harness_fragments;
+        let mut fragments = harness_fragments;
+        if let Some(fragment) = self.litellm.fragment()? {
+            fragments.push(fragment);
+        }
+        config.fragments = fragments;
         config.env_from_secret_names = self.env_from_secret_names();
+        config.additional_egress_ports = self.litellm.additional_egress_ports();
         if let Some(labels) = self
             .api_pod_label_selector
             .as_ref()
@@ -1885,6 +1893,46 @@ impl IronProxyHarnessArgs {
             fragments.push(fragment);
         }
         Ok(fragments)
+    }
+}
+
+#[derive(Debug, ClapArgs)]
+struct IronProxyLitellmArgs {
+    /// Comma-separated hostnames for in-cluster LiteLLM credential injection
+    /// (e.g. `centaur-centaur-litellm,centaur-centaur-litellm.centaur.svc`).
+    #[arg(
+        long = "kubernetes-iron-proxy-litellm-hosts",
+        env = "KUBERNETES_IRON_PROXY_LITELLM_HOSTS",
+        value_delimiter = ','
+    )]
+    hosts: Vec<String>,
+    /// Extra upstream TCP ports the per-sandbox iron-proxy may reach (e.g. 4000
+    /// for in-cluster LiteLLM HTTP).
+    #[arg(
+        long = "kubernetes-iron-proxy-additional-egress-ports",
+        env = "KUBERNETES_IRON_PROXY_ADDITIONAL_EGRESS_PORTS",
+        value_delimiter = ','
+    )]
+    additional_egress_ports: Vec<u16>,
+}
+
+impl IronProxyLitellmArgs {
+    fn fragment(&self) -> Result<Option<ProxyFragment>, ServerError> {
+        let hosts: Vec<String> = self
+            .hosts
+            .iter()
+            .map(|host| host.trim().to_owned())
+            .filter(|host| !host.is_empty())
+            .collect();
+        litellm_auth_fragment(&hosts).map_err(ServerError::from)
+    }
+
+    fn additional_egress_ports(&self) -> Vec<u16> {
+        self.additional_egress_ports
+            .iter()
+            .copied()
+            .filter(|port| *port > 0)
+            .collect()
     }
 }
 

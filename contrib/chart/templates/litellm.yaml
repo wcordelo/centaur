@@ -1,0 +1,99 @@
+{{- if .Values.litellm.enabled }}
+{{- $litellmName := include "centaur.litellmName" . }}
+{{- $secretName := required "litellm.existingSecretName is required when litellm.enabled=true" .Values.litellm.existingSecretName }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $litellmName }}-config
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "litellm") | nindent 4 }}
+data:
+  config.yaml: |
+{{ .Files.Get "files/litellm/config.yaml" | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $litellmName }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "litellm") | nindent 4 }}
+spec:
+  selector:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "litellm") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.litellm.service.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $litellmName }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "litellm") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "litellm") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "litellm") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: litellm
+          image: {{ printf "%s:%s" .Values.litellm.image.repository .Values.litellm.image.tag | quote }}
+          imagePullPolicy: {{ .Values.litellm.image.pullPolicy }}
+          args:
+            - --config
+            - /app/config.yaml
+            - --port
+            - {{ .Values.litellm.service.port | quote }}
+            - --host
+            - "0.0.0.0"
+          ports:
+            - name: http
+              containerPort: {{ .Values.litellm.service.port }}
+          env:
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: LITELLM_MASTER_KEY
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: OPENAI_API_KEY
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+{{ toYaml .Values.litellm.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $litellmName }}-config
+{{- end }}

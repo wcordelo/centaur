@@ -83,6 +83,9 @@ pub struct IronProxyConfig {
     pub op_connect_app_name: String,
     pub op_connect_port: u16,
     pub api_pod_labels: BTreeMap<String, String>,
+    /// Extra TCP ports iron-proxy may reach on upstream hosts (e.g. in-cluster
+    /// LiteLLM on :4000). Merged into the per-sandbox proxy egress policy.
+    pub additional_egress_ports: Vec<u16>,
 }
 
 impl IronProxyConfig {
@@ -106,6 +109,7 @@ impl IronProxyConfig {
                 "app.kubernetes.io/component".to_owned(),
                 "api".to_owned(),
             )]),
+            additional_egress_ports: Vec::new(),
         }
     }
 }
@@ -1346,6 +1350,11 @@ fn proxy_egress_rules(
     if control_port != 443 && control_port != 5432 {
         upstream_ports.push(network_port(control_port));
     }
+    for port in &iron_proxy.additional_egress_ports {
+        if *port != 443 && *port != 5432 && *port != control_port {
+            upstream_ports.push(network_port(*port));
+        }
+    }
     let mut rules = vec![
         dns_egress_rule(),
         egress_to(
@@ -2321,5 +2330,18 @@ mod tests {
             !value.split(',').any(|host| host == "vllm.prod.example.com"),
             "non-allowlisted vLLM host must not be added to NO_PROXY: {value}"
         );
+    }
+
+    #[test]
+    fn proxy_egress_rules_include_additional_ports() {
+        let mut config = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        config.additional_egress_ports = vec![4000];
+        let rules = super::proxy_egress_rules(&config, 3000);
+        let has_4000 = rules.iter().any(|rule| {
+            rule.ports
+                .as_ref()
+                .is_some_and(|ports| ports.iter().any(|port| port.port == Some(4000)))
+        });
+        assert!(has_4000, "expected port 4000 in iron-proxy egress rules");
     }
 }

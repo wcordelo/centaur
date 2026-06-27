@@ -39,6 +39,20 @@ app.kubernetes.io/component: {{ .component }}
 {{- printf "%s-%s" (include "centaur.fullname" .root) .component | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{- define "centaur.litellmName" -}}
+{{- include "centaur.componentName" (dict "root" . "component" "litellm") -}}
+{{- end -}}
+
+{{- define "centaur.litellmHosts" -}}
+{{- $name := include "centaur.litellmName" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- printf "%s,%s.%s.svc,%s.%s.svc.cluster.local" $name $name $ns $name $ns -}}
+{{- end -}}
+
+{{- define "centaur.litellmUrl" -}}
+{{- printf "http://%s:%v/v1" (include "centaur.litellmName" .) .Values.litellm.service.port -}}
+{{- end -}}
+
 {{- define "centaur.secretEnvName" -}}
 {{- required "secretManager.existingSecretName is required" .Values.secretManager.existingSecretName | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
