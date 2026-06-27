@@ -115,6 +115,10 @@ _import-k3s:
 bootstrap-secrets *args:
     contrib/scripts/bootstrap-k8s-secrets.sh --namespace {{namespace}} {{args}}
 
+# Fetch and merge latest changes from paradigmxyz/centaur (adds upstream remote if needed).
+sync-upstream *args:
+    contrib/scripts/sync-upstream.sh {{args}}
+
 deploy:
     #!/usr/bin/env bash
     set -euo pipefail
