@@ -419,6 +419,52 @@ mkdir -p "$HOME_DIR/uploads"
 WORKSPACE_DIR="$WORKSPACE_DIR" install-tool-shims --refresh-skills \
     || echo "warning: failed to reload Centaur skills" >&2
 
+# Default persona env so introspection commands and the [Active deployment]
+# block stay consistent when no persona is assigned.
+export AGENT_PERSONA="${AGENT_PERSONA:-(none)}"
+
+write_active_deployment_block() {
+    local harness
+    harness="${CENTAUR_HARNESS_TYPE:-unknown}"
+    if [ "$harness" = "unknown" ] && [ -f /etc/centaur/sandbox-harness ]; then
+        harness="$(tr -d '[:space:]' < /etc/centaur/sandbox-harness)"
+    fi
+    local model="${CODEX_MODEL:-}"
+    if [ -z "$model" ] && [ -n "${CLAUDE_MODEL:-}" ]; then
+        model="$CLAUDE_MODEL"
+    fi
+    if [ -z "$model" ]; then
+        model="(not configured)"
+    fi
+    local provider="${CODEX_MODEL_PROVIDER:-}"
+    if [ -z "$provider" ] && [ "${CODEX_USE_VLLM:-0}" = "1" ]; then
+        provider="vllm"
+    fi
+    if [ -z "$provider" ]; then
+        provider="(default)"
+    fi
+    cat <<EOF
+[Active deployment]
+harness: ${harness}
+model: ${model}
+model_provider: ${provider}
+persona: ${AGENT_PERSONA}
+overlay_dir: ${CENTAUR_OVERLAY_DIR:-(none)}
+thread_key: ${CENTAUR_THREAD_KEY:-(none)}
+
+EOF
+}
+
+prepend_active_deployment_block() {
+    local prompt_path="$1"
+    [ -f "$prompt_path" ] || return 0
+    local tmp
+    tmp="$(mktemp)"
+    write_active_deployment_block > "$tmp"
+    cat "$prompt_path" >> "$tmp"
+    mv "$tmp" "$prompt_path"
+}
+
 # ── Assemble system prompt from bind mounts ──────────────────────────────────
 # Base prompt: mounted as AGENTS_BASE.md when present, fallback to baked-in AGENTS.md.
 # Org/persona overlays are mounted alongside the base prompt when present.
@@ -442,6 +488,8 @@ elif [ -n "${CENTAUR_OVERLAY_DIR:-}" ] \
     printf '\n\n---\n\n' >> "$TARGET_PROMPT"
     cat "${CENTAUR_OVERLAY_DIR}/services/sandbox/SYSTEM_PROMPT.md" >> "$TARGET_PROMPT"
 fi
+
+prepend_active_deployment_block "$TARGET_PROMPT"
 
 if [ "${CENTAUR_SANDBOX_OBSERVABILITY_ENABLED:-true}" = "false" ] && [ -f "$TARGET_PROMPT" ]; then
     cat >> "$TARGET_PROMPT" <<'EOF'

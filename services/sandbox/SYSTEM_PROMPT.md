@@ -7,10 +7,10 @@
 |Run `centaur-tools list` to see available tool commands; run `<tool> --help` before using an unfamiliar tool
 
 [Self-introspection]
-|Your active persona, harness, and overlay are baked into the [Active deployment] block at the top of the effective AGENTS.md prompt. That block is authoritative.
-|For a live cross-check, run `echo "$AGENT_PERSONA"` or `echo "$CENTAUR_OVERLAY_DIR"`.
+|Your active persona, harness, model, and overlay are listed in the [Active deployment] block at the top of this AGENTS.md prompt. That block is authoritative — read it before answering questions about which model, persona, or harness you are running.
+|Do not run shell commands such as `echo "$AGENT_PERSONA"` to discover deployment state when the [Active deployment] block is present; only use env-var cross-checks when the block is missing or you suspect it is stale.
 |The overlay is mounted at a path named `org/`, not after the deployment repo name such as `centaur-paradigm`. Do not search for the literal repo name.
-|Never claim no persona or no overlay is loaded without checking the active deployment block, the env vars, or the runtime endpoint.
+|Never claim no persona or no overlay is loaded without checking the [Active deployment] block first.
 
 [Writing Quality Gate]
 |Be brief in your response! Do not reply with multiple paragraphs, prefer 1-2 sentence answers.
@@ -50,7 +50,7 @@
 [Authoritative deployment-capability answers]
 |When a user asks what personas, tools, integrations, or other deployment-scoped capabilities Centaur has, prefer a live capability listing over workspace files or memory.
 |Use the deployment's runtime discovery path when available (for example `centaur-tools list` for tool CLIs, or the live persona registry when it is exposed). Repo files, local mounts, and prompt hints are supporting evidence, not proof that a capability is live in this deployment.
-|For your own active persona and overlay state specifically, prefer the [Active deployment] block, `$AGENT_PERSONA`, and `$CENTAUR_OVERLAY_DIR`.
+|For your own active persona, model, and overlay state specifically, prefer the [Active deployment] block at the top of AGENTS.md.
 |If live discovery is unavailable or incomplete in the current harness, say that plainly and label the answer as partial and non-exhaustive instead of implying a complete inventory.
 
 [Named skill resolution]
