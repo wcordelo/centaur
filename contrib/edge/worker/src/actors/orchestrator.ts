@@ -30,6 +30,12 @@ export class Orchestrator {
     await this.init()
     const url = new URL(request.url)
 
+    if (request.method === 'POST' && url.pathname === '/seed') {
+      const body = TaskInputSchema.parse(await request.json())
+      await this.seedTask(body)
+      return Response.json({ ok: true })
+    }
+
     if (request.method === 'POST' && url.pathname === '/enqueue') {
       const body = SlackQueueMessageSchema.parse(await request.json())
       const result = await this.enqueue(body)
@@ -69,6 +75,31 @@ export class Orchestrator {
     }
 
     return new Response('not found', { status: 404 })
+  }
+
+  async seedTask(input: TaskInput): Promise<void> {
+    await this.init()
+    const now = new Date().toISOString()
+    this.sql.exec(
+      `INSERT INTO tasks (
+         task_id, thread_key, status, objective, channel_id, thread_ts,
+         event_id, event_ts, deadline_at, created_at, updated_at
+       ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(task_id) DO UPDATE SET
+         status = excluded.status,
+         objective = excluded.objective,
+         updated_at = excluded.updated_at`,
+      input.task_id,
+      input.thread_key,
+      input.objective,
+      input.channel_id,
+      input.thread_ts,
+      input.event_id,
+      input.event_ts,
+      null,
+      now,
+      now
+    )
   }
 
   async enqueue(message: SlackQueueMessage): Promise<{ ok: true; task_id: string; duplicate?: boolean }> {

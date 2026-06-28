@@ -2,7 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "centaur-edge",
   "main": "worker/src/index.ts",
-  "compatibility_date": "2026-04-01",
+  "compatibility_date": "2025-09-06",
   "compatibility_flags": ["nodejs_compat"],
   "limits": {
     "cpu_ms": 300000
@@ -36,13 +36,13 @@
   ],
   "durable_objects": {
     "bindings": [
-      { "name": "ORCHESTRATOR", "class_name": "Orchestrator", "script_name": "centaur-edge" },
-      { "name": "RESEARCHER", "class_name": "Researcher", "script_name": "centaur-edge" },
-      { "name": "VERIFIER", "class_name": "Verifier", "script_name": "centaur-edge" }
+      { "name": "ORCHESTRATOR", "class_name": "Orchestrator" },
+      { "name": "RESEARCHER", "class_name": "Researcher" },
+      { "name": "VERIFIER", "class_name": "Verifier" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_classes": ["Orchestrator", "Researcher", "Verifier"] }
+    { "tag": "v1", "new_sqlite_classes": ["Orchestrator", "Researcher", "Verifier"] }
   ],
   "r2_buckets": [
     {
