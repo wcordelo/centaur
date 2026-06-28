@@ -71,6 +71,13 @@ spec:
                 secretKeyRef:
                   name: {{ $secretName }}
                   key: OPENAI_API_KEY
+                  optional: true
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: GEMINI_API_KEY
+                  optional: true
           volumeMounts:
             - name: config
               mountPath: /app/config.yaml

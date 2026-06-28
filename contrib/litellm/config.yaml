@@ -1,6 +1,19 @@
 # LiteLLM proxy config for Centaur in-cluster deployments.
 # Provider keys are injected via the centaur-litellm-env Secret (not sandboxes).
+# Gemini models MUST use the gemini/ prefix (Google AI Studio API key), not bare names.
 model_list:
+  - model_name: gemini/gemini-2.0-flash
+    litellm_params:
+      model: gemini/gemini-2.0-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: gemini-2.0-flash
+    litellm_params:
+      model: gemini/gemini-2.0-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: gemini/gemini-2.5-flash
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
   - model_name: openai/gpt-4o-mini
     litellm_params:
       model: openai/gpt-4o-mini

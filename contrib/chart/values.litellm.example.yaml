@@ -10,7 +10,8 @@
 #
 # Prerequisites:
 #   export LITELLM_MASTER_KEY="$(openssl rand -hex 32)"
-#   export OPENAI_API_KEY=sk-...   # real key — LiteLLM pod only (see bootstrap)
+#   export GEMINI_API_KEY=...        # Google AI Studio key (https://aistudio.google.com/apikey)
+#   # optional: export OPENAI_API_KEY=sk-...   # only if using OpenAI models in config
 #   just bootstrap-secrets
 #
 # Do NOT put OPENAI_API_KEY in centaur-infra-env via sync-local-env.sh on this
@@ -29,4 +30,4 @@ sandbox:
     CODEX_MODEL_PROVIDER: "vllm"
     VLLM_BASE_URL: http://centaur-centaur-litellm:4000/v1
     VLLM_API_KEY: LITELLM_API_KEY
-    CODEX_MODEL: openai/gpt-4o-mini
+    CODEX_MODEL: gemini/gemini-2.5-flash

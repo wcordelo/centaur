@@ -4,7 +4,7 @@
 set -euo pipefail
 
 NAMESPACE="${CENTAUR_NAMESPACE:-centaur}"
-MODEL="${LITELLM_VERIFY_MODEL:-openai/gpt-4o-mini}"
+MODEL="${LITELLM_VERIFY_MODEL:-gemini/gemini-2.5-flash}"
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "FATAL: missing command: $1" >&2; exit 1; }
@@ -12,7 +12,7 @@ require_cmd() {
 
 require_cmd kubectl
 
-SANDBOX_POD="$(kubectl get pods -n "$NAMESPACE" -l centaur.ai/managed-by=api-rs -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+SANDBOX_POD="$(kubectl get pods -n "$NAMESPACE" -l centaur.ai/component=session-sandbox -o jsonpath='{.items[-1].metadata.name}' 2>/dev/null || true)"
 
 if [[ -z "$SANDBOX_POD" ]]; then
   echo "FATAL: need at least one sandbox pod (centaur.ai/managed-by=api-rs) in namespace $NAMESPACE" >&2

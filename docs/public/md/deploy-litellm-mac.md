@@ -10,7 +10,7 @@ proxy** (see [Routing](#routing) below).
 ```
 Slack → slackbotv2 → api-rs → centaur-agent (Codex, modelProvider=vllm)
                               ↓ NO_PROXY (direct)
-                         centaur-centaur-litellm:4000 → OpenAI
+                         centaur-centaur-litellm:4000 → Gemini (or OpenAI)
                               ↓ HTTPS_PROXY (iron-proxy)
                          github.com, slack.com, …
 ```
@@ -27,7 +27,8 @@ pattern as host vLLM and OTLP bypass:
 - api-rs injects the real **`LITELLM_MASTER_KEY`** into sandbox `VLLM_API_KEY`
   at pod create time (chart template still says `VLLM_API_KEY=LITELLM_API_KEY`)
 
-Real **`OPENAI_API_KEY`** lives **only** on the LiteLLM pod (`centaur-litellm-env`).
+Real provider keys live **only** on the LiteLLM pod (`centaur-litellm-env`):
+`GEMINI_API_KEY` (Google AI Studio) and/or `OPENAI_API_KEY`.
 
 ### Required sandbox env
 
@@ -36,7 +37,7 @@ Real **`OPENAI_API_KEY`** lives **only** on the LiteLLM pod (`centaur-litellm-en
 | `CODEX_USE_VLLM` | `1` | Selects `config.vllm.toml` in the agent entrypoint |
 | `CODEX_MODEL_PROVIDER` | `vllm` | harness-server must pass `modelProvider=vllm` to Codex at thread start |
 | `VLLM_BASE_URL` | `http://centaur-centaur-litellm:4000/v1` | Codex vLLM provider base URL |
-| `CODEX_MODEL` | e.g. `openai/gpt-4o-mini` | Must match a model in `contrib/litellm/config.yaml` |
+| `CODEX_MODEL` | e.g. `gemini/gemini-2.5-flash` | Must match a model in `contrib/litellm/config.yaml` (use `gemini/` prefix for Google) |
 
 Without **`CODEX_MODEL_PROVIDER=vllm`**, harness-server defaults to
 `modelProvider=openai` while `config.toml` says `vllm` — turns hang after
@@ -65,10 +66,14 @@ Create `.env` at the repo root (see [local-slack-dev.md](local-slack-dev.md)):
 | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACKBOT_API_KEY` | Slack + internal api-rs auth |
 | `OP_SERVICE_ACCOUNT_TOKEN`, `OP_VAULT` | Placeholder OK for env-mode (`local-placeholder`) |
 | `LITELLM_MASTER_KEY` | `openssl rand -hex 32` |
-| `OPENAI_API_KEY` | Real key — **LiteLLM pod only**; do not sync into `centaur-infra-env` on this path |
+| `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/apikey) — **LiteLLM pod only**; `GOOGLE_API_KEY` in `.env` is accepted as an alias |
+| `OPENAI_API_KEY` | Optional — only if using OpenAI models in LiteLLM config |
 
-**OpenAI account:** Codex uses the Responses API (`wire_api = "responses"`).
-Some orgs must [verify the organization](https://platform.openai.com/settings/organization/general)
+**Gemini (recommended for personal dev):** Codex `/v1/responses` works through LiteLLM
+with `CODEX_MODEL=gemini/gemini-2.5-flash` and no OpenAI org verification.
+
+**OpenAI account:** If you use `openai/*` models, Codex uses the Responses API
+(`wire_api = "responses"`). Some orgs must [verify the organization](https://platform.openai.com/settings/organization/general)
 before full Codex turns succeed; a simple LiteLLM curl may work while Codex gets
 403 until verification completes.
 
@@ -229,7 +234,7 @@ Docker, verifies the kind cluster, then runs `just up`.
 
 ## Secret hygiene (important)
 
-- **Do** put `OPENAI_API_KEY` only in `centaur-litellm-env` (via `just bootstrap-secrets` with `OPENAI_API_KEY` set).
+- **Do** put `GEMINI_API_KEY` and/or `OPENAI_API_KEY` only in `centaur-litellm-env` (via `just bootstrap-secrets`).
 - **Do** put `LITELLM_MASTER_KEY` in bootstrap; api-rs copies it into sandbox `VLLM_API_KEY` when `VLLM_BASE_URL` points at in-cluster LiteLLM.
 - **Do not** run `contrib/scripts/sync-local-env.sh` with a real `OPENAI_API_KEY` on this path — that copies the provider key into `centaur-infra-env` and iron-control may inject it for `api.openai.com`.
 
@@ -250,10 +255,11 @@ cargo run -p centaur-perms -- principals grant slack-channel-<team>-<channel> --
 |---------|----------------|
 | Turn hangs after `remoteControl/status/changed` only | Missing `CODEX_MODEL_PROVIDER=vllm` — redeploy overlay, recycle sandboxes |
 | 405 via `HTTPS_PROXY` to LiteLLM | Expected — use direct path (`NO_PROXY`); do not curl LiteLLM through iron-proxy |
-| LiteLLM curl OK, Codex turn 403 | OpenAI org verification for Responses API; try after verifying org or use a permitted model |
+| LiteLLM curl OK, Codex turn 403 | OpenAI org verification — switch to `gemini/gemini-2.0-flash` + `GEMINI_API_KEY`, or verify org |
+| Gemini 401/403 from LiteLLM | Invalid or missing `GEMINI_API_KEY` — use an AI Studio key (`AIza…`), not Vertex OAuth tokens |
 | 401 from LiteLLM | Wrong or missing master key in sandbox — rebuild api-rs, cold-create sandbox |
 | Codex hits `api.openai.com` | `CODEX_MODEL_PROVIDER` not `vllm` or `CODEX_USE_VLLM` unset — check `SESSION_SANDBOX_EXTRA_ENV` |
-| LiteLLM pod CrashLoop | Missing `centaur-litellm-env` — bootstrap with `OPENAI_API_KEY` + `LITELLM_MASTER_KEY` |
+| LiteLLM pod CrashLoop | Missing `centaur-litellm-env` — bootstrap with `LITELLM_MASTER_KEY` + `GEMINI_API_KEY` and/or `OPENAI_API_KEY` |
 | Tailscale funnel fails | Enable Funnel + HTTPS certs in tailnet admin; visit the enable URL from `tailscale funnel` CLI output |
 | Slack 200 but no reply | Bot not in channel, missing `channels:history`, or fake channel in manual webhook tests |
 

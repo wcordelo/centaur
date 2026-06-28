@@ -76,9 +76,13 @@ Optional LiteLLM in-cluster bootstrap (consumed when litellm.enabled=true):
                               LiteLLM pod LITELLM_MASTER_KEY. Auto-generated when
                               absent. Patched into centaur-infra-env as
                               LITELLM_API_KEY for iron-control proxy injection.
-  OPENAI_API_KEY              real provider key — written to centaur-litellm-env
-                              only (not centaur-infra-env). Required when
-                              LITELLM_MASTER_KEY is set.
+  GEMINI_API_KEY              Google AI Studio key for gemini/* models on the
+                              LiteLLM pod (centaur-litellm-env). Accepts
+                              GOOGLE_API_KEY as an alias when GEMINI_API_KEY is unset.
+  OPENAI_API_KEY              OpenAI provider key — centaur-litellm-env only (not
+                              centaur-infra-env). At least one of GEMINI_API_KEY
+                              (or GOOGLE_API_KEY) or OPENAI_API_KEY is required when
+                              bootstrapping LiteLLM.
 
 EOF
 }
@@ -341,20 +345,26 @@ else
 fi
 
 # LiteLLM provider + virtual key secrets (litellm.enabled overlay).
-if [[ -n "${LITELLM_MASTER_KEY:-}" || -n "${OPENAI_API_KEY:-}" ]]; then
+GEMINI_API_KEY="${GEMINI_API_KEY:-${GOOGLE_API_KEY:-}}"
+if [[ -n "${LITELLM_MASTER_KEY:-}" || -n "${OPENAI_API_KEY:-}" || -n "${GEMINI_API_KEY:-}" ]]; then
   if [[ -z "${LITELLM_MASTER_KEY:-}" ]]; then
     LITELLM_MASTER_KEY="$(rand_hex)"
     echo "Generated LITELLM_MASTER_KEY"
   fi
-  if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-    echo "FATAL: OPENAI_API_KEY is required when bootstrapping LiteLLM (centaur-litellm-env)" >&2
+  if [[ -z "${OPENAI_API_KEY:-}" && -z "${GEMINI_API_KEY:-}" ]]; then
+    echo "FATAL: set GEMINI_API_KEY (or GOOGLE_API_KEY) and/or OPENAI_API_KEY when bootstrapping LiteLLM (centaur-litellm-env)" >&2
     exit 1
   fi
   litellm_args=(
     -n "$NAMESPACE" create secret generic centaur-litellm-env
     --from-literal=LITELLM_MASTER_KEY="$LITELLM_MASTER_KEY"
-    --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY"
   )
+  if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+    litellm_args+=(--from-literal=OPENAI_API_KEY="$OPENAI_API_KEY")
+  fi
+  if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+    litellm_args+=(--from-literal=GEMINI_API_KEY="$GEMINI_API_KEY")
+  fi
   if secret_exists centaur-litellm-env; then
     if [[ "$FORCE" == "1" ]]; then
       kubectl -n "$NAMESPACE" delete secret centaur-litellm-env --ignore-not-found >/dev/null
