@@ -1,23 +1,39 @@
 # Centaur Edge — Cloudflare Actor Framework
 
-This directory is the greenfield home for the **Centaur-less** edge migration on branch `edge/cloudflare`.
+Greenfield **Centaur-less** stack on branch [`edge/cloudflare`](https://github.com/wcordelo/centaur/tree/edge/cloudflare).
+
+## Docs
+
+- **[Architecture & gap resolutions](../../docs/public/md/edge-actor-framework.md)** — authoritative design (all adversarial gaps addressed)
+- [Notion migration spec](https://app.notion.com/p/Centaur-to-Edge-Migration-Spec-38d34448009481f58864e58be2a71c97)
+- Draft PR: [#11](https://github.com/wcordelo/centaur/pull/11)
+
+## Stack
+
+| Layer | Technology |
+|-------|------------|
+| Ingress | Worker + **Queue** (3s Slack ack) |
+| Task DAG | **Cloudflare Workflows** |
+| Hot state | **Orchestrator / Researcher / Verifier DOs** + SQLite |
+| Blobs | **R2** |
+| LLM | **AI Gateway** → Anthropic/OpenAI |
+| Research | Parallel/Exa (TS client) |
+
+K8s Centaur on `main` is unchanged until cutover.
 
 ## Status
 
-Scaffold only. Implementation follows the migration plan:
-
-- **Spec:** [Centaur-to-Edge Migration Spec](https://app.notion.com/p/Centaur-to-Edge-Migration-Spec-38d34448009481f58864e58be2a71c97)
-- **Architecture:** Orchestrator / Researcher / Verifier Durable Objects, per-DO SQLite, Fiber async loops via alarms, Wasm research modules, AI Gateway LLM routing
-
-## Branch workflow
-
-All edge work lands on `edge/cloudflare` via PR into `main`. Do not commit edge changes directly to `main`.
-
-The K8s/Rust stack on `main` (`contrib/chart/`, `services/api-rs/`, etc.) remains the production path until edge MVP is reviewed and cut over.
+**Planning complete** — implementation Phases 1–5 per architecture doc. Scaffold only in repo until Phase 1 lands.
 
 ## Deploy (future)
 
 ```bash
 cd contrib/edge
-wrangler deploy
+pnpm install
+wrangler deploy --env staging   # or production
 ```
+
+## Branch rules
+
+- All edge work on `edge/cloudflare` (or `edge/cloudflare/*` → PR into integration branch)
+- Never commit edge changes directly to `main`
