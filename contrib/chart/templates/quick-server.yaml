@@ -74,7 +74,8 @@ spec:
           {{- end }}
           {{- end }}
           image: {{ $quickImage | quote }}
-          command: ["python", "-m", "quick.server"]
+          imagePullPolicy: {{ .Values.apiRs.image.pullPolicy }}
+          command: ["python3", "-m", "quick.server"]
           env:
             - name: PYTHONPATH
               value: /app/tools/infra

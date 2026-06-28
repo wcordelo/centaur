@@ -26,12 +26,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from .client import (
+from .site_paths import (
     DEFAULT_BASE_DOMAIN,
     DEFAULT_INDEX,
     DEFAULT_LOCAL_ROOT,
     MANIFEST_DIR,
-    _content_type,
+    content_type as _content_type,
     is_valid_site_id,
 )
 

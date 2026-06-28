@@ -34,55 +34,24 @@ import httpx
 
 from centaur_sdk import secret
 
+from .site_paths import (
+    DEFAULT_BASE_DOMAIN,
+    DEFAULT_INDEX,
+    DEFAULT_LOCAL_ROOT,
+    MANIFEST_DIR,
+    MANIFEST_PATH,
+    content_type as _content_type,
+    is_valid_site_id,
+)
+
 # A site_id becomes a DNS label (``<site_id>.quick.internal``), so it must be a
 # valid, lowercase DNS label: 1-63 chars, alphanumeric, internal hyphens only.
 _SITE_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-
-DEFAULT_BASE_DOMAIN = "quick.internal"
-DEFAULT_LOCAL_ROOT = "/srv/quick-sites"
-DEFAULT_INDEX = "index.html"
-
-# Reserved per-site metadata prefix. The manifest records the deploy owner and
-# file list, powering ownership checks, stale-file cleanup on redeploys, and
-# get/delete on the s3 backend. User files may not be written under it and the
-# serving layer never serves it.
-MANIFEST_DIR = "_quick"
-MANIFEST_PATH = f"{MANIFEST_DIR}/manifest.json"
 DEFAULT_OWNER = "anonymous"
 
-# Guardrails to keep a single deploy bounded.
 MAX_FILES = 500
 MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
-
-# Explicit content types for the web file types the Quick platform serves. These
-# take priority over ``mimetypes`` so charset and JS module types stay correct.
-_CONTENT_TYPES = {
-    ".html": "text/html; charset=utf-8",
-    ".htm": "text/html; charset=utf-8",
-    ".css": "text/css; charset=utf-8",
-    ".js": "application/javascript; charset=utf-8",
-    ".mjs": "application/javascript; charset=utf-8",
-    ".cjs": "application/javascript; charset=utf-8",
-    ".json": "application/json; charset=utf-8",
-    ".map": "application/json; charset=utf-8",
-    ".txt": "text/plain; charset=utf-8",
-    ".xml": "application/xml; charset=utf-8",
-    ".csv": "text/csv; charset=utf-8",
-    ".svg": "image/svg+xml",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-    ".avif": "image/avif",
-    ".ico": "image/x-icon",
-    ".woff": "font/woff",
-    ".woff2": "font/woff2",
-    ".ttf": "font/ttf",
-    ".otf": "font/otf",
-    ".wasm": "application/wasm",
-}
 
 
 class QuickDeployError(RuntimeError):
@@ -99,20 +68,6 @@ def _cfg(key: str, default: str) -> str:
     """
     val = secret(key, default)
     return default if val == key else val
-
-
-def _content_type(path: str) -> str:
-    """Best content type for a file path, biased toward web defaults."""
-    ext = Path(path).suffix.lower()
-    if ext in _CONTENT_TYPES:
-        return _CONTENT_TYPES[ext]
-    guessed, _ = mimetypes.guess_type(path)
-    return guessed or "application/octet-stream"
-
-
-def is_valid_site_id(site_id: str) -> bool:
-    """Return whether ``site_id`` is a valid DNS label (defense-in-depth for the server)."""
-    return bool(_SITE_ID_RE.match(site_id.strip().lower()))
 
 
 def _validate_site_id(site_id: str) -> str:

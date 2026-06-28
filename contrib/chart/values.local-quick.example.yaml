@@ -1,0 +1,23 @@
+# Example overlay: enable Quick static-site deploy + point tool sync at your fork.
+#
+# Layer on top of values.local-slack.example.yaml:
+#   export CENTAUR_EXTRA_VALUES="contrib/chart/values.local-slack.example.yaml:contrib/chart/values.local-quick.example.yaml"
+#   just deploy
+#
+# Requires quick/ on main in toolServer.repo (default: wcordelo/centaur fork).
+
+apiRs:
+  image:
+    pullPolicy: IfNotPresent
+
+quick:
+  enabled: true
+  # baseDomain defaults to quick.internal
+  persistence:
+    # kind's default local-path provisioner is RWO-only; bind a pre-created
+    # hostPath PV (see contrib/chart/manifests/quick-sites-local-pv.yaml).
+    storageClassName: manual
+
+toolServer:
+  repo: wcordelo/centaur
+  ref: main

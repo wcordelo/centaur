@@ -1,0 +1,17 @@
+# One-time hostPath PV for Quick on single-node kind (RWX via shared node path).
+# Apply before helm when using values.local-quick.example.yaml:
+#   kubectl apply -f contrib/chart/manifests/quick-sites-local-pv.yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: centaur-quick-sites-local
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
+  hostPath:
+    path: /tmp/centaur-quick-sites
+    type: DirectoryOrCreate
