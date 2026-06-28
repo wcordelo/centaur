@@ -1,0 +1,69 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "centaur-edge",
+  "main": "worker/src/index.ts",
+  "compatibility_date": "2026-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "limits": {
+    "cpu_ms": 300000
+  },
+  "vars": {
+    "LLM_MODE": "mock",
+    "EDGE_TASK_DEADLINE_MS": "1800000"
+  },
+  "queues": {
+    "producers": [
+      {
+        "binding": "SLACK_EVENTS",
+        "queue": "centaur-slack-events"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "centaur-slack-events",
+        "max_batch_size": 1,
+        "max_retries": 3,
+        "dead_letter_queue": "centaur-slack-events-dlq"
+      }
+    ]
+  },
+  "workflows": [
+    {
+      "binding": "TASK_WORKFLOW",
+      "name": "centaur-task-workflow",
+      "class_name": "TaskWorkflow"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "ORCHESTRATOR", "class_name": "Orchestrator", "script_name": "centaur-edge" },
+      { "name": "RESEARCHER", "class_name": "Researcher", "script_name": "centaur-edge" },
+      { "name": "VERIFIER", "class_name": "Verifier", "script_name": "centaur-edge" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_classes": ["Orchestrator", "Researcher", "Verifier"] }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BLOBS",
+      "bucket_name": "centaur-edge-blobs"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "EDGE_FLAGS",
+      "id": "00000000000000000000000000000000"
+    }
+  ],
+  "env": {
+    "staging": {
+      "name": "centaur-edge-staging",
+      "vars": { "LLM_MODE": "mock" }
+    },
+    "production": {
+      "name": "centaur-edge-prod",
+      "vars": { "LLM_MODE": "live" }
+    }
+  }
+}

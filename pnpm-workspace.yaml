@@ -1,5 +1,6 @@
 packages:
   - packages/*
+  - contrib/edge
   - services/linearbot
   - services/slackbotv2
   - services/discordbot

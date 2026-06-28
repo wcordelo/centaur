@@ -23,7 +23,14 @@ K8s Centaur on `main` is unchanged until cutover.
 
 ## Status
 
-**Planning complete** — implementation Phases 1–5 per architecture doc. Scaffold only in repo until Phase 1 lands.
+**Phase 1 scaffold implemented** — Wrangler project, Queue ingress, 3 DOs, TaskWorkflow skeleton, mock LLM, Vitest + CI.
+
+```bash
+cd contrib/edge
+pnpm install   # from repo root: pnpm install
+pnpm test
+pnpm deploy:dry-run
+```
 
 ## Deploy (future)
 
