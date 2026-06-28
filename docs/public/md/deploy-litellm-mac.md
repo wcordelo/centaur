@@ -86,13 +86,20 @@ just build-one api-rs
 just build-one slackbotv2
 just build-one iron-proxy
 just build-one agent
+just build-one litellm    # tracks latest stable LiteLLM (see contrib/litellm/VERSION)
 contrib/scripts/build-iron-control-local.sh
+LITELLM_TAG="$(tr -d '[:space:]' < contrib/litellm/VERSION)"
 kind load docker-image centaur-api-rs:latest centaur-slackbotv2:latest \
-  centaur-iron-proxy:latest centaur-agent:latest iron-control:local-arm64 \
-  --name centaur
+  centaur-iron-proxy:latest centaur-agent:latest "centaur-litellm:${LITELLM_TAG}" \
+  iron-control:local-arm64 --name centaur
 ```
 
 After changing `services/sandbox/entrypoint.sh`, rebuild and reload **agent**.
+
+LiteLLM version is pinned in `contrib/litellm/VERSION` (default: latest stable from
+GitHub). `just build-one litellm` refreshes that pin automatically; set
+`CENTAUR_LITELLM_TRACK_LATEST=0` to keep a fixed version. Manual bump:
+`just update-litellm-version`.
 
 ### 2. Bootstrap secrets + deploy
 

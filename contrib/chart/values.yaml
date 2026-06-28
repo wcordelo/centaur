@@ -507,7 +507,7 @@ litellm:
   enabled: false
   image:
     repository: centaur-litellm
-    tag: v1.88.5
+    tag: v1.90.0
     pullPolicy: IfNotPresent
   service:
     port: 4000

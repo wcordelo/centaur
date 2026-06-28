@@ -62,6 +62,7 @@ build-one service:
       teamsbot) just _build-teamsbot ;;
       agent|sandbox) just _build-agent ;;
       console) just _build-console ;;
+      litellm) just _build-litellm ;;
       *) echo "unknown service: {{service}}" >&2; exit 2 ;;
     esac
 
@@ -87,6 +88,24 @@ _build-agent:
 # the other services which build from the repo root.
 _build-console:
     docker build -t centaur-console:latest -f services/console/Dockerfile services/console
+
+_build-litellm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "${CENTAUR_LITELLM_TRACK_LATEST:-1}" =~ ^(1|true|yes)$ ]]; then
+      chmod +x contrib/scripts/litellm-resolve-version.sh
+      contrib/scripts/litellm-resolve-version.sh --write
+    fi
+    version="$(tr -d '[:space:]' < contrib/litellm/VERSION)"
+    docker build \
+      --build-arg "LITELLM_VERSION=${version}" \
+      -t "centaur-litellm:${version}" \
+      -f contrib/litellm/Dockerfile contrib/litellm
+
+# Bump contrib/litellm/VERSION + chart values.yaml to the latest stable LiteLLM release.
+update-litellm-version:
+    chmod +x contrib/scripts/litellm-resolve-version.sh
+    contrib/scripts/litellm-resolve-version.sh --write
 
 # Push locally-built images to the local registry under library/ so k3s pulls
 # them via its docker.io mirror. Used by `just up k3s`. Only changed layers are
