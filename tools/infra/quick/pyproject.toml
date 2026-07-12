@@ -20,6 +20,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["."]
 
+[tool.hatch.build.targets.wheel.sources]
+"." = "quick"
+
 [tool.centaur]
 module = "client.py"
 # The default 'local' backend needs no secrets. To enable the 's3' backend
