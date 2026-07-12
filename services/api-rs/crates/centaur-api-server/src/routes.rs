@@ -54,11 +54,15 @@ use uuid::Uuid;
 
 use crate::{
     ApiError,
+    api_jwt::{bearer_jwt_from_headers, decode_jwt_payload, verify_console_jwt},
+    mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
+    slack_proxy::slack_proxy_router,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
-        ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse, SessionSseEvent,
-        SlackThreadContext, stream_error_sse,
+        InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, ListWorkflowRunsQuery,
+        OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
+        stream_error_sse,
     },
 };
 
@@ -125,7 +129,15 @@ impl AppState {
         self.initialized().is_some()
     }
 
-    fn runtime(&self) -> Result<SessionRuntime, ApiError> {
+    /// The session runtime, if initialization completed. Unlike the private
+    /// request-path accessor this does not error while starting; the
+    /// shutdown path uses it to skip the execution handoff when the runtime
+    /// never came up.
+    pub fn session_runtime(&self) -> Option<SessionRuntime> {
+        self.initialized().map(|initialized| initialized.runtime)
+    }
+
+    pub(crate) fn runtime(&self) -> Result<SessionRuntime, ApiError> {
         self.initialized()
             .map(|initialized| initialized.runtime)
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))
@@ -189,6 +201,15 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/api/personas", get(list_personas))
+        .route("/mcp", post(mcp_post).get(mcp_get))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(mcp_protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(mcp_protected_resource_metadata),
+        )
         .route(
             "/api/session/{thread_key}",
             post(create_or_get_session).get(get_session_context),
@@ -201,8 +222,13 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             "/api/session/{thread_key}/execute",
             post(execute_session).layer(DefaultBodyLimit::disable()),
         )
+        .route(
+            "/api/session/{thread_key}/interrupt",
+            post(interrupt_session_execution),
+        )
         .route("/api/session/{thread_key}/events", get(stream_events))
         .route("/api/sandboxes/drain", post(drain_sandboxes))
+        .merge(slack_proxy_router())
         .route("/api/workflows/schedules", get(list_workflow_schedules))
         .route(
             "/api/workflows/runs",
@@ -311,8 +337,30 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn healthz() -> Json<Value> {
-    Json(json!({"ok": true}))
+async fn healthz(headers: HeaderMap) -> Json<Value> {
+    let mut body = json!({"ok": true});
+    if let Some(token) = bearer_jwt_from_headers(&headers) {
+        body["slack_client_jwt"] = match decode_jwt_payload(token) {
+            Ok(claims) => {
+                let mut jwt = json!({ "claims": claims });
+                match verify_console_jwt::<Value>(token) {
+                    Ok(_) => {
+                        jwt["valid"] = json!(true);
+                    }
+                    Err(error) => {
+                        jwt["valid"] = json!(false);
+                        jwt["error"] = json!(error.to_string());
+                    }
+                }
+                jwt
+            }
+            Err(error) => json!({
+                "valid": false,
+                "error": error,
+            }),
+        };
+    }
+    Json(body)
 }
 
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
@@ -404,10 +452,22 @@ async fn get_session_context(
     State(state): State<AppState>,
     Path(raw_thread_key): Path<String>,
 ) -> Result<Json<SessionContextResponse>, ApiError> {
-    let _runtime = state.runtime()?;
+    let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let title = match runtime.session_title(&thread_key).await {
+        Ok(title) => title,
+        Err(error) => {
+            tracing::warn!(
+                thread_key = %thread_key,
+                %error,
+                "failed to load optional session title"
+            );
+            None
+        }
+    };
     Ok(Json(SessionContextResponse {
         slack: slack_thread_context(&thread_key),
+        title,
         thread_key,
     }))
 }
@@ -481,6 +541,30 @@ async fn execute_session(
         execution_id: execution.execution_id,
         thread_key: execution.thread_key,
         status: execution.status.to_string(),
+    }))
+}
+
+async fn interrupt_session_execution(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+    Json(request): Json<InterruptSessionExecutionRequest>,
+) -> Result<Json<InterruptSessionExecutionResponse>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let reason = request
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Interrupted from Slack");
+    let outcome = state
+        .runtime()?
+        .interrupt_active_execution(&thread_key, reason)
+        .await?;
+    Ok(Json(InterruptSessionExecutionResponse {
+        ok: true,
+        interrupted: outcome.interrupted,
+        execution_id: outcome.execution_id,
+        thread_key,
     }))
 }
 
@@ -2270,14 +2354,14 @@ fn slack_archive_upload_config() -> Result<SlackArchiveUploadConfig, ApiError> {
     })
 }
 
-fn non_empty_env(name: &str) -> Option<String> {
+pub(crate) fn non_empty_env(name: &str) -> Option<String> {
     env::var(name)
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
 }
 
-fn positive_env_u64(name: &str, default: u64) -> u64 {
+pub(crate) fn positive_env_u64(name: &str, default: u64) -> u64 {
     env::var(name)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -2867,7 +2951,7 @@ fn signature_header_name(auth: &WorkflowWebhookAuth) -> Option<&str> {
     }
 }
 
-fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
         .and_then(|value| value.to_str().ok())
