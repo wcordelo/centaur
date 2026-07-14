@@ -210,7 +210,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const lateSlackFiles = createLateSlackFileRepair(options, state)
 
   chat.onNewMention(async (thread, message) => {
-    if (!isAllowedSlackMessage(message, options, logger)) return
+    if (!(await isAllowedSlackMessage(message, options, logger))) return
     lateSlackFiles.rememberFilelessMention(thread, message)
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: true,
@@ -223,7 +223,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   })
 
   chat.onSubscribedMessage(async (thread, message) => {
-    if (!isAllowedSlackMessage(message, options, logger)) return
+    if (!(await isAllowedSlackMessage(message, options, logger))) return
     lateSlackFiles.rememberFilelessMention(thread, message)
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: message.isMention === true,
