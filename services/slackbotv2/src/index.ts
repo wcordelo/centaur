@@ -47,13 +47,12 @@ import {
 } from './session-api'
 import {
   buildConsoleSessionContextBlock,
-  defaultCodexEffort,
-  defaultCodexSpeed,
   defaultModelForHarness,
   type SlackContextBlock
 } from './console-session-link'
 import { resolveChannelDefault } from './channel-defaults'
-import { extractMessageOverrides } from './overrides'
+import { type HarnessOverrides } from './overrides'
+import { createFlagMessageOverridesStrategy } from './message-overrides-strategy'
 import { buildQuickDeployCardFromRefs, findQuickSiteUrls, quickActionId } from './quick-card'
 import { parseQuickAction, quickActionPrompt } from './quick-actions'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
@@ -153,6 +152,23 @@ type PendingLateSlackFileMention = {
 }
 
 type StickyThreadOverrides = Pick<SlackbotV2ThreadState, 'harnessType' | 'model' | 'provider'>
+const DEFAULT_MESSAGE_OVERRIDES_STRATEGY = createFlagMessageOverridesStrategy()
+
+export async function messageOverridesForText(
+  options: SlackbotV2Options,
+  text: string,
+  trace: SlackbotV2Trace
+): Promise<{ cleanedText?: string; overrides: HarnessOverrides }> {
+  const strategy = options.messageOverridesStrategy ?? DEFAULT_MESSAGE_OVERRIDES_STRATEGY
+  try {
+    return await strategy({ text })
+  } catch (error) {
+    traceWarn(options, 'slackbotv2_message_overrides_strategy_failed', trace, {
+      error: errorMessage(error)
+    })
+    return { overrides: {} }
+  }
+}
 
 function stickyThreadOverrideUpdate(
   overrides: StickyThreadOverrides
@@ -659,6 +675,8 @@ type SyncThreadMessageInput = {
   options: SlackbotV2Options
   /** Number of in-process retries already spent on this message's handoff. */
   retryAttempt?: number
+  /** Resolved once per local handoff chain so retryable failures stay idempotent. */
+  resolvedMessageOverrides?: Awaited<ReturnType<typeof messageOverridesForText>>
   state: StateAdapter
 }
 
@@ -814,8 +832,17 @@ async function syncThreadMessageToSession(
 
   const serializeStartedAtMs = nowMs()
   const serializedMessage = await serializeMessage(message, input.options)
-  const overrides = extractMessageOverrides(serializedMessage.text)
-  setMessageText(serializedMessage, overrides.cleanedText)
+  const messageOverrides =
+    input.resolvedMessageOverrides ??
+    (input.resolvedMessageOverrides = await messageOverridesForText(
+      input.options,
+      serializedMessage.text,
+      trace
+    ))
+  if (messageOverrides.cleanedText !== undefined) {
+    setMessageText(serializedMessage, messageOverrides.cleanedText)
+  }
+  const overrides = messageOverrides.overrides
   const stickyOverridesUpdate = stickyThreadOverrideUpdate(overrides)
   const effectiveOverrides = resolveStickyThreadOverrides(state, stickyOverridesUpdate)
   // Slack-only "Open chat in Console" link on the FIRST assistant message in
@@ -849,19 +876,12 @@ async function syncThreadMessageToSession(
   const effectiveModel =
     resolvedModel ??
     defaultModelForHarness(effectiveHarnessType, input.options.harnessDefaultModels)
-  const effectiveEffort =
-    effectiveHarnessType === 'codex'
-      ? overrides.reasoning ?? defaultCodexEffort(input.options.codexDefaultReasoningEffort)
-      : undefined
-  const effectiveSpeed = effectiveHarnessType === 'codex' ? defaultCodexSpeed() : undefined
   const consoleSessionBlock = isFirstAssistantMessage
     ? buildConsoleSessionContextBlock({
         consoleBaseUrl: input.options.consolePublicUrl,
         threadKey: thread.id,
         harnessType: effectiveHarnessType,
-        model: effectiveModel,
-        effort: effectiveEffort,
-        speed: effectiveSpeed
+        model: effectiveModel
       })
     : undefined
   if (overrides.harnessType || overrides.model || overrides.provider || overrides.reasoning) {

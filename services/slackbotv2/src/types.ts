@@ -3,6 +3,7 @@ import type { CodexAppServerToChatStreamOptions } from '@centaur/rendering'
 import type { Attachment, Chat, Logger, StateAdapter } from 'chat'
 import type { Hono } from 'hono'
 import type { ChannelDefaults } from './channel-defaults'
+import type { HarnessOverrides } from './overrides'
 import type { SlackDisplayTextSource } from './slack-display-text'
 
 export type JsonPrimitive = string | number | boolean | null
@@ -120,8 +121,6 @@ export type SlackbotV2Options = {
    * the block entirely.
    */
   consolePublicUrl?: string
-  /** Codex effort displayed in Slack when no per-turn `-rsn` override is set. */
-  codexDefaultReasoningEffort?: string
   /**
    * Per-channel default harness/model/provider/reasoning, keyed by Slack
    * conversation id (SLACKBOTV2_CHANNEL_DEFAULTS). See channel-defaults.ts.
@@ -141,6 +140,8 @@ export type SlackbotV2Options = {
    * harness config files (see console-session-link.ts).
    */
   harnessDefaultModels?: Record<string, string>
+  /** Strategy for resolving message-level harness/model/provider/reasoning overrides. */
+  messageOverridesStrategy?: MessageOverridesStrategy
   /**
    * Backoff delays between in-process retries of a Slack handoff after a
    * retryable session API failure. Slack's own webhook redelivery cannot
@@ -178,6 +179,19 @@ export type SlackbotV2Options = {
   userName?: string
   mapper?: CodexAppServerToChatStreamOptions
 }
+
+export type MessageOverridesStrategyInput = {
+  text: string
+}
+
+export type MessageOverridesStrategyResult = {
+  cleanedText?: string
+  overrides: HarnessOverrides
+}
+
+export type MessageOverridesStrategy = (
+  input: MessageOverridesStrategyInput
+) => Promise<MessageOverridesStrategyResult>
 
 export type SlackbotV2 = {
   app: Hono

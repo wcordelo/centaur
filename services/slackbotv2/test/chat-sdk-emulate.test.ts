@@ -25,7 +25,6 @@ import {
 import { clearRequesterIdentityCacheForTests } from '../src/session-api'
 import { slackbotMetrics } from '../src/metrics'
 import claudeSettings from '../../../harness/claude/settings.json'
-import codexConfig from '../../../harness/codex/config.toml'
 
 const BOT_TOKEN = 'xoxb-slackbotv2-emulate'
 const USER_TOKEN = 'xoxp-slackbotv2-user'
@@ -535,7 +534,10 @@ describe('slackbotv2', () => {
         .filter(text => text.includes('Open chat in Console'))
 
     const parent = await postUserMessage('Default model thread context.')
-    const mention = await postUserMessage(`<@${BOT_USER_ID}> what is your current model?`, parent.ts)
+    const mention = await postUserMessage(
+      `<@${BOT_USER_ID}> --claude what is your current model?`,
+      parent.ts
+    )
     const waits: Promise<unknown>[] = []
     const response = await bot.app.request(
       '/api/webhooks/slack',
@@ -548,7 +550,7 @@ describe('slackbotv2', () => {
           team: TEAM_ID,
           ts: mention.ts,
           thread_ts: parent.ts,
-          text: `<@${BOT_USER_ID}> what is your current model?`
+          text: `<@${BOT_USER_ID}> --claude what is your current model?`
         }
       }),
       {},
@@ -559,17 +561,15 @@ describe('slackbotv2', () => {
 
     const blocks = consoleBlockTexts(slackApi.calls)
     expect(blocks).toHaveLength(1)
-    expect(blocks[0]).toContain('Codex')
-    expect(blocks[0]).toContain(codexConfig.model.toUpperCase())
-    expect(blocks[0]).toContain('Effort: Low')
-    expect(blocks[0]).toContain('Speed: Fast')
+    expect(blocks[0]).toContain('Claude Code')
+    expect(blocks[0]).toContain(claudeSettings.model.toUpperCase())
 
     // The effective (default) model is recorded in execution metadata for the
     // Console, but never forwarded to the harness — only explicit overrides
     // ride the input lines.
     expect(codexApi.executes).toHaveLength(1)
     const executeBody = codexApi.executes[0]!.body
-    expect(executeBody.metadata.model).toBe(codexConfig.model)
+    expect(executeBody.metadata.model).toBe(claudeSettings.model)
     expect(JSON.parse(executeBody.input_lines.at(-1)!).model).toBeUndefined()
   })
 
@@ -4122,7 +4122,19 @@ describe('slackbotv2', () => {
   })
 
   it('reuses an accepted execution when the local retry follows a lost execute response', async () => {
-    bot = createTestBot({ handoffRetryDelaysMs: [50] })
+    let overrideStrategyCalls = 0
+    bot = createTestBot({
+      handoffRetryDelaysMs: [50],
+      messageOverridesStrategy: async () => {
+        overrideStrategyCalls += 1
+        return {
+          overrides: {
+            harnessType: overrideStrategyCalls === 1 ? 'claudecode' : 'codex',
+            model: overrideStrategyCalls === 1 ? 'claude-opus-4-8' : 'gpt-5.6-sol'
+          }
+        }
+      }
+    })
     codexApi.failNextExecuteAfterAccept = true
 
     const parent = await postUserMessage('History before response loss.')
@@ -4157,6 +4169,15 @@ describe('slackbotv2', () => {
     expect(codexApi.executes.map(execute => execute.body.idempotency_key)).toEqual([
       mention.ts,
       mention.ts
+    ])
+    expect(overrideStrategyCalls).toBe(1)
+    expect(
+      codexApi.executes.map(execute =>
+        JSON.parse(execute.body.input_lines.at(-1) ?? '{}') as Record<string, unknown>
+      )
+    ).toEqual([
+      expect.objectContaining({ model: 'claude-opus-4-8' }),
+      expect.objectContaining({ model: 'claude-opus-4-8' })
     ])
     expect(codexApi.appends).toHaveLength(1)
     expect(codexApi.eventRequests).toHaveLength(1)
