@@ -286,6 +286,63 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "Root Slack bot post", item[:text]
   end
 
+  test "transcript messages expose stored image attachments as bounded inline data" do
+    controller = Console::ThreadsController.new
+    controller.define_singleton_method(:current_slack_user_ids) { [] }
+    controller.instance_variable_set(:@selected_session, TranscriptSession.new(metadata_hash: {}))
+    image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    message = TranscriptMessage.new(
+      role: "user",
+      parts_array: [
+        { "type" => "text", "text" => "See attached." },
+        {
+          "type" => "attachment",
+          "attachment_type" => "image",
+          "dataBase64" => image_data,
+          "mimeType" => "image/png",
+          "name" => "screenshot.png",
+          "width" => 1440,
+          "height" => 900
+        }
+      ],
+      metadata_hash: {},
+      created_at: Time.zone.parse("2026-06-26 17:15:58 UTC")
+    )
+
+    item = controller.send(:transcript_item_for_message, message)
+
+    assert_equal "See attached.", item[:text]
+    assert_equal [
+      {
+        src: "data:image/png;base64,#{image_data}",
+        alt: "screenshot.png",
+        width: 1440,
+        height: 900
+      }
+    ], item[:images]
+  end
+
+  test "transcript images reject remote, unsafe, malformed, and oversized image data" do
+    controller = Console::ThreadsController.new
+    message = TranscriptMessage.new(
+      role: "user",
+      parts_array: [
+        { "type" => "attachment", "attachment_type" => "image", "mimeType" => "image/png",
+          "url" => "https://files.example.test/private.png" },
+        { "type" => "attachment", "attachment_type" => "image", "mimeType" => "image/svg+xml",
+          "dataBase64" => "PHN2Zz4=" },
+        { "type" => "attachment", "attachment_type" => "image", "mimeType" => "image/png",
+          "dataBase64" => "not base64" },
+        { "type" => "attachment", "attachment_type" => "image", "mimeType" => "image/png",
+          "dataBase64" => "A" * (Console::ThreadsController::MAX_INLINE_IMAGE_BASE64_CHARS + 1) }
+      ],
+      metadata_hash: {},
+      created_at: Time.zone.now
+    )
+
+    assert_empty controller.send(:transcript_message_images, message)
+  end
+
   test "slack message text resolves mentions from bot identity and selected actor metadata" do
     controller = Console::ThreadsController.new
     controller.define_singleton_method(:current_slack_user_ids) { [ "u123" ] }
@@ -762,28 +819,22 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     end
   end
 
-  test "selected session resolves a directly linked thread only within the owner scope" do
-    controller = Console::ThreadsController.new
-    owned_thread = SelectedSession.new(thread_key: "slack:C123:1782339173.755169")
-    scoped_relation = Object.new
-    scoped_relation.define_singleton_method(:where) do |thread_key:|
-      thread_key == owned_thread.thread_key ? [ owned_thread ] : []
+  test "opening a direct thread skips recent chat discovery" do
+    skip_unless_session_table
+    thread_key = "console:direct-load-#{SecureRandom.hex(6)}"
+    insert_console_session(thread_key)
+
+    without_session_list_query do
+      get console_threads_url(thread: thread_key)
     end
-    controller.instance_variable_set(:@starting_new_thread, false)
-    controller.instance_variable_set(:@sessions, [])
 
-    # An owned key outside the base window is recovered through the scope.
-    controller.instance_variable_set(:@selected_thread_key, owned_thread.thread_key)
-    assert_equal owned_thread, controller.send(:selected_session, scoped_relation, [])
-
-    # A key the scope does not own has no unscoped fallback, so it stays hidden.
-    controller.instance_variable_set(:@selected_thread_key, "slack:C999:1782339173.999999")
-    assert_nil controller.send(:selected_session, scoped_relation, [])
+    assert_response :ok
+    assert_select ".console-thread-detail-header", count: 1
   end
 
-  test "renders the sidebar New chat link and the full-page composer" do
-    with_composer do
-      with_recent_first_error do
+  test "renders the full-page composer without loading sessions" do
+    without_session_list_query do
+      with_composer do
         get console_threads_url(new: 1)
       end
     end
@@ -913,8 +964,8 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "the new sentinel alone renders the full-page new chat screen" do
-    with_composer do
-      with_recent_first_error do
+    without_session_list_query do
+      with_composer do
         get console_threads_url(thread: "new")
       end
     end
@@ -1361,6 +1412,23 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_includes item[:text], "```text\nok\n```"
   end
 
+  test "thinking extraction omits file change status events" do
+    controller = Console::ThreadsController.new
+    line = {
+      method: "item/completed",
+      params: {
+        item: {
+          type: "fileChange",
+          status: "completed",
+          changes: [ { path: "app/models/thread.rb", kind: "update" } ]
+        }
+      }
+    }.to_json
+    event = OutputLineEvent.new(payload: line, created_at: Time.zone.now)
+
+    assert_nil controller.send(:thinking_transcript_item, event)
+  end
+
   test "compact trace grouping combines adjacent command executions for one run" do
     controller = Console::ThreadsController.new
     now = Time.zone.now
@@ -1767,6 +1835,16 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     yield
   ensure
     singleton.define_method(:recent_first, original)
+  end
+
+  def without_session_list_query
+    calls = 0
+    replacement = -> {
+      calls += 1
+      raise ActiveRecord::ConnectionNotEstablished
+    }
+    with_singleton_method(CentaurSession, :recent_first, replacement) { yield }
+    assert_equal 0, calls, "explicit chat loads must not query the recent session list"
   end
 
   def threads_controller_for(user)
