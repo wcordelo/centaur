@@ -73,7 +73,7 @@ pub struct AgentSandboxConfig {
     pub runtime_class_name: Option<String>,
     pub state_volume: Option<StateVolumeConfig>,
     pub iron_proxy: Option<IronProxyConfig>,
-    pub iron_control: Option<IronControlSettings>,
+    pub iron_control: IronControlSettings,
     /// When set, every sandbox gets a `tools-bootstrap` init container that
     /// git-clones the tools repo into the agent's `/app/tools`, and `TOOL_DIRS`
     /// is set so the agent's shim installer finds them.
@@ -110,7 +110,7 @@ pub struct LitellmEgressTarget {
     pub no_proxy_hosts: Vec<String>,
 }
 
-/// iron-control coordinates for sync-mode egress proxies. When set, a sandbox
+/// iron-control coordinates for sync-mode egress proxies. A sandbox
 /// whose spec carries an `iron_control_principal` gets a per-sandbox proxy
 /// registered in iron-control (synced over `IRON_CONTROL_URL` with its
 /// `iprx_` token) instead of a rendered static proxy config.
@@ -124,8 +124,17 @@ pub struct IronControlSettings {
     pub namespace: String,
 }
 
+#[cfg(test)]
+fn test_iron_control_settings() -> IronControlSettings {
+    IronControlSettings {
+        client: IronControlClient::new("http://127.0.0.1:1", "test-key"),
+        control_url: "http://iron-control".to_owned(),
+        namespace: "default".to_owned(),
+    }
+}
+
 impl AgentSandboxConfig {
-    pub fn new(namespace: impl Into<String>) -> Self {
+    pub fn new(namespace: impl Into<String>, iron_control: IronControlSettings) -> Self {
         Self {
             namespace: namespace.into(),
             field_manager: "centaur-api-rs".to_owned(),
@@ -139,7 +148,7 @@ impl AgentSandboxConfig {
             runtime_class_name: None,
             state_volume: None,
             iron_proxy: None,
-            iron_control: None,
+            iron_control,
             tools: None,
             otlp_egress: None,
             host_egress_ports: Vec::new(),
@@ -155,11 +164,6 @@ impl AgentSandboxConfig {
 
     pub fn iron_proxy(mut self, iron_proxy: IronProxyConfig) -> Self {
         self.iron_proxy = Some(iron_proxy);
-        self
-    }
-
-    pub fn iron_control(mut self, iron_control: IronControlSettings) -> Self {
-        self.iron_control = Some(iron_control);
         self
     }
 
@@ -209,11 +213,17 @@ impl AgentSandboxBackend {
         }
     }
 
-    pub async fn try_default(namespace: impl Into<String>) -> SandboxResult<Self> {
+    pub async fn try_default(
+        namespace: impl Into<String>,
+        iron_control: IronControlSettings,
+    ) -> SandboxResult<Self> {
         let client = Client::try_default()
             .await
             .map_err(|err| SandboxError::backend_source("create kube client", err))?;
-        Ok(Self::new(client, AgentSandboxConfig::new(namespace)))
+        Ok(Self::new(
+            client,
+            AgentSandboxConfig::new(namespace, iron_control),
+        ))
     }
 
     fn sandboxes(&self) -> Api<crd::Sandbox> {
@@ -1020,7 +1030,7 @@ mod tests {
                     .limit("memory", "512Mi")
                     .limit("example.com/gpu", "1"),
             );
-        let config = AgentSandboxConfig::new("centaur")
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings())
             .state_volume(StateVolumeConfig::new("/home/agent/state", "10Gi"));
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
@@ -1082,7 +1092,7 @@ mod tests {
                 .request("memory", "4Gi")
                 .limit("memory", "4Gi"),
         );
-        let config = AgentSandboxConfig::new("centaur");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
 
@@ -1106,7 +1116,7 @@ mod tests {
     #[test]
     fn omits_resources_when_unset() {
         let spec = SandboxSpec::new("centaur-agent:latest");
-        let config = AgentSandboxConfig::new("centaur");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
 
@@ -1120,7 +1130,7 @@ mod tests {
     #[test]
     fn node_steering_reaches_the_sandbox_pod_template() {
         let spec = SandboxSpec::new("centaur-agent:latest");
-        let mut config = AgentSandboxConfig::new("centaur");
+        let mut config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
         config.node_selector =
             BTreeMap::from([("workload".to_owned(), "centaur-sandbox".to_owned())]);
         config.tolerations = vec![Toleration {
@@ -1155,7 +1165,7 @@ mod tests {
     #[test]
     fn node_steering_is_omitted_when_unset() {
         let spec = SandboxSpec::new("centaur-agent:latest");
-        let config = AgentSandboxConfig::new("centaur");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
         let pod_spec = &sandbox.spec.pod_template.spec;
@@ -1172,7 +1182,7 @@ mod tests {
             observability_enabled: true,
             api_server_enabled: true,
         });
-        let config = AgentSandboxConfig::new("centaur");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
 
@@ -1225,7 +1235,7 @@ mod tests {
             observability_enabled: false,
             api_server_enabled: false,
         });
-        let config = AgentSandboxConfig::new("centaur");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
 
@@ -1285,7 +1295,7 @@ mod tests {
             })
             .env("CENTAUR_SANDBOX_OBSERVABILITY_ENABLED", "true")
             .env("CENTAUR_SANDBOX_API_SERVER_ENABLED", "true");
-        let config = AgentSandboxConfig::new("centaur");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
         let mut sandbox =
             build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
 
@@ -1339,7 +1349,7 @@ mod tests {
             observability_enabled: false,
             api_server_enabled: false,
         });
-        let config = AgentSandboxConfig::new("centaur");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
 
         let labels = sandbox_capability_labels(&sandbox, DEFAULT_CONTAINER_NAME, "asbx-test");
@@ -1367,7 +1377,7 @@ mod tests {
         // resolved per-sandbox proxy URL arrives on the spec env.
         let spec = SandboxSpec::new("centaur-agent:latest")
             .env("HTTPS_PROXY", "http://asbx-test-iron-proxy:8080");
-        let config = AgentSandboxConfig::new("centaur")
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings())
             .tools(ToolsConfig::new("paradigmxyz/centaur", "api:test"))
             .iron_proxy(IronProxyConfig::new("proxy:test", "ca-cert", "ca-key"));
 
@@ -1389,7 +1399,7 @@ mod tests {
 
         // Without iron-proxy the clone goes direct: no proxy exports, no CA mount.
         let spec = SandboxSpec::new("centaur-agent:latest");
-        let config = AgentSandboxConfig::new("centaur")
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings())
             .tools(ToolsConfig::new("paradigmxyz/centaur", "api:test"));
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
         let bootstrap = &sandbox
@@ -1420,7 +1430,7 @@ mod tests {
         });
         let mut tools = ToolsConfig::new("paradigmxyz/centaur", "api:test");
         tools.repo_cache_path = Some("/var/lib/centaur/repos".to_owned());
-        let config = AgentSandboxConfig::new("centaur").tools(tools);
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings()).tools(tools);
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
         let pod_spec = &sandbox.spec.pod_template.spec;
@@ -1456,7 +1466,7 @@ mod tests {
     #[test]
     fn bootstrap_empty_dirs_are_writable_by_agent_uid() {
         let spec = SandboxSpec::new("centaur-agent:latest");
-        let config = AgentSandboxConfig::new("centaur")
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings())
             .tools(ToolsConfig::new("paradigmxyz/centaur", "api:test"));
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
