@@ -1530,6 +1530,7 @@ async fn register_role_with_retry(
 fn should_retry_iron_control_register(error: &RegisterError) -> bool {
     match error {
         RegisterError::Translate(_) => false,
+        RegisterError::Control(IronControlError::PrincipalDerivation(_)) => false,
         RegisterError::Control(IronControlError::Transport { .. }) => true,
         RegisterError::Control(IronControlError::Decode { .. }) => false,
         RegisterError::Control(IronControlError::Status { status, .. }) => {
