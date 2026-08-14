@@ -67,18 +67,16 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal "custom-user", principal.labels["slack_user_id"]
   end
 
-  test "console user identity is stored only in columns" do
+  test "console user identity is stored as an association" do
     user = users(:acme_admin)
     principal = Principal.create!(default_attrs(
       kind: "console_user",
       console_user_id: user.id,
-      console_user_email: user.email,
       labels: { "managed-by" => "centaur" }
     ))
 
     principal.reload
     assert_equal user.id, principal.console_user_id
-    assert_equal user.email, principal.console_user_email
     assert_empty principal.labels.slice("console-user-id", "email")
     assert_nil principal.labels_with_sandbox_capabilities["console-user-id"]
     assert_nil principal.labels_with_sandbox_capabilities["email"]
@@ -124,21 +122,16 @@ class PrincipalTest < ActiveSupport::TestCase
     end
   end
 
-  test "console user principals permit missing user references but require valid email" do
+  test "console user principals permit missing user references" do
     user = users(:acme_admin)
     principal = Principal.new(default_attrs(
       kind: "console_user",
-      console_user_id: user.id,
-      console_user_email: user.email
+      console_user_id: user.id
     ))
     assert principal.valid?
 
     principal.console_user_id = nil
     assert principal.valid?
-
-    principal.console_user_email = "not-an-email"
-    assert_not principal.valid?
-    assert_predicate principal.errors[:console_user_email], :any?
   end
 
   test "unchanged malformed migrated Slack identities do not block unrelated saves" do
@@ -404,12 +397,15 @@ class PrincipalTest < ActiveSupport::TestCase
     end
   end
 
-  test "api server JWT does not infer permissions from Slack channel identity" do
+  test "api server JWT does not infer Slack permissions from channel identity" do
     with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
       principal = principals(:acme_channel)
       principal.update!(slack_channel_id: "C0123456789")
 
-      assert_nil ApiServer::Jwt.encode_for_principal(principal)
+      claims = jwt_payload(ApiServer::Jwt.encode_for_principal(principal))
+      assert_empty claims.dig("slack", "upload_channels")
+      assert_empty claims.dig("slack", "download_channels")
+      assert_empty claims.dig("slack", "history_channels")
     end
   end
 
@@ -432,7 +428,10 @@ class PrincipalTest < ActiveSupport::TestCase
       SlackChannelPermission.replace_for!(principal, [])
 
       assert_empty principal.slack_channel_permissions.reload
-      assert_nil ApiServer::Jwt.encode_for_principal(principal)
+      claims = jwt_payload(ApiServer::Jwt.encode_for_principal(principal))
+      assert_empty claims.dig("slack", "upload_channels")
+      assert_empty claims.dig("slack", "download_channels")
+      assert_empty claims.dig("slack", "history_channels")
     end
   end
 

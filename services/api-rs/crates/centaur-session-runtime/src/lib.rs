@@ -189,15 +189,6 @@ pub struct PersonaDefinition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PersonaSummary {
-    pub id: String,
-    pub source_root: String,
-    pub source_path: String,
-    pub source_ref: Option<String>,
-    pub prompt_hash: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PersonaContext {
     pub persona_id: String,
     pub source_root: String,
@@ -239,19 +230,6 @@ impl PersonaRegistry {
     ) -> Self {
         self.public_source_roots = public_source_roots.into_iter().collect();
         self
-    }
-
-    pub fn summaries(&self) -> Vec<PersonaSummary> {
-        self.personas
-            .values()
-            .map(|persona| PersonaSummary {
-                id: persona.id.clone(),
-                source_root: persona.source_root.clone(),
-                source_path: persona.source_path.clone(),
-                source_ref: persona.source_ref.clone(),
-                prompt_hash: persona.prompt_hash.clone(),
-            })
-            .collect()
     }
 
     fn default_persona_id(&self) -> Option<&str> {
@@ -884,18 +862,16 @@ impl SessionRuntime {
         self
     }
 
-    pub fn personas(&self) -> Vec<PersonaSummary> {
-        self.personas
-            .as_ref()
-            .map(|personas| personas.summaries())
-            .unwrap_or_default()
-    }
-
     pub async fn session_title(
         &self,
         thread_key: &ThreadKey,
     ) -> Result<Option<String>, SessionRuntimeError> {
         Ok(self.store.get_session_title(thread_key).await?)
+    }
+
+    /// Load the durable session for API resource authorization.
+    pub async fn session(&self, thread_key: &ThreadKey) -> Result<Session, SessionRuntimeError> {
+        Ok(self.store.get_session(thread_key).await?)
     }
 
     /// Returns the harness already persisted for a thread, if the session
@@ -7079,7 +7055,7 @@ mod tests {
     }
 
     #[test]
-    fn persona_registry_validates_default_and_summarizes_without_prompt() {
+    fn persona_registry_validates_default_and_omits_prompt_when_serialized() {
         let registry = PersonaRegistry::new(
             [PersonaDefinition {
                 id: "eng".to_owned(),
@@ -7094,10 +7070,6 @@ mod tests {
         )
         .unwrap();
 
-        let summaries = registry.summaries();
-
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].id, "eng");
         assert!(
             serde_json::to_value(registry.get("eng").unwrap())
                 .unwrap()
