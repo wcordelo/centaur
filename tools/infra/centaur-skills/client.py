@@ -111,7 +111,7 @@ class SkillsClient:
         instructions: str | None = None,
         lock_version: int | None = None,
     ) -> dict[str, Any]:
-        """Edit an owned Console skill by OID."""
+        """Edit an owned or editable Console skill by OID."""
         attributes: dict[str, str | int] = {}
         if name is not None:
             attributes["name"] = name
@@ -133,13 +133,51 @@ class SkillsClient:
             raise RuntimeError("centaur-skills response did not include a data object")
         return result
 
+    def delete(self, identifier: str) -> None:
+        """Archive an owned Console skill by OID."""
+        self._request(
+            f"{SANDBOX_SKILLS_PATH}/{quote(identifier, safe='')}",
+            method="DELETE",
+        )
+
+    def list_editors(self, identifier: str) -> dict[str, Any]:
+        """List editors for a visible Console skill by exact name or OID."""
+        result = self._request(
+            f"{SANDBOX_SKILLS_PATH}/{quote(identifier, safe='')}/editors"
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("centaur-skills response did not include a data object")
+        return result
+
+    def add_editor(self, identifier: str, user: str) -> dict[str, Any]:
+        """Add an editor to an owned skill by exact email or Console user OID."""
+        return self._manage_editor(identifier, user, method="POST")
+
+    def remove_editor(self, identifier: str, user: str) -> dict[str, Any]:
+        """Remove an editor from an owned skill by exact email or Console user OID."""
+        return self._manage_editor(identifier, user, method="DELETE")
+
+    def _manage_editor(self, identifier: str, user: str, *, method: str) -> dict[str, Any]:
+        normalized_user = user.strip()
+        if not normalized_user:
+            raise ValueError("user email or OID must not be empty")
+
+        result = self._request(
+            f"{SANDBOX_SKILLS_PATH}/{quote(identifier, safe='')}/editors",
+            method=method,
+            json={"data": {"user": normalized_user}},
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("centaur-skills response did not include a data object")
+        return result
+
     def _request(
         self,
         path: str,
         method: str = "GET",
         params: dict[str, str | int] | None = None,
         json: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | list[dict[str, Any]]:
+    ) -> dict[str, Any] | list[dict[str, Any]] | None:
         try:
             response = self.client.request(method, path, params=params, json=json)
             response.raise_for_status()
@@ -148,6 +186,9 @@ class SkillsClient:
             raise RuntimeError(f"centaur-skills request failed: {detail}") from exc
         except httpx.RequestError as exc:
             raise RuntimeError(f"centaur-skills request failed: {exc}") from exc
+
+        if not response.content:
+            return None
 
         payload = response.json()
         data = payload.get("data")

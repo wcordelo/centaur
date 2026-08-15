@@ -2,7 +2,17 @@ import json
 
 import httpx
 import pytest
-from cli import create, edit, list_skills, read, search
+from cli import (
+    add_editor,
+    create,
+    delete,
+    edit,
+    editors,
+    list_skills,
+    read,
+    remove_editor,
+    search,
+)
 from client import SANDBOX_SKILLS_PATH, SkillsClient
 
 
@@ -136,6 +146,64 @@ def test_edit_requires_a_field():
         make_client(lambda _request: json_response({})).edit("skl_123")
 
 
+def test_delete_archives_skill_by_oid():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "DELETE"
+        assert request.url.path == f"{SANDBOX_SKILLS_PATH}/skl_123"
+        return httpx.Response(204)
+
+    result = make_client(handler).delete("skl_123")
+
+    assert result is None
+
+
+def test_list_add_and_remove_editors_use_editor_endpoint():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response(
+            {
+                "data": {
+                    "id": "skl_123",
+                    "editors": [
+                        {
+                            "id": "usr_456",
+                            "email": "editor@example.com",
+                            "name": "Editor",
+                            "status": "active",
+                        }
+                    ],
+                    "lock_version": 3,
+                }
+            }
+        )
+
+    client = make_client(handler)
+    listed = client.list_editors("skl_123")
+    added = client.add_editor("skl_123", " editor@example.com ")
+    removed = client.remove_editor("skl_123", "usr_456")
+
+    assert listed["editors"][0]["id"] == "usr_456"
+    assert added["lock_version"] == 3
+    assert removed["id"] == "skl_123"
+    assert [request.method for request in requests] == ["GET", "POST", "DELETE"]
+    assert all(
+        request.url.path == f"{SANDBOX_SKILLS_PATH}/skl_123/editors"
+        for request in requests
+    )
+    assert json.loads(requests[1].content) == {"data": {"user": "editor@example.com"}}
+    assert json.loads(requests[2].content) == {"data": {"user": "usr_456"}}
+
+
+@pytest.mark.parametrize("method", ["add_editor", "remove_editor"])
+def test_editor_mutations_require_a_user(method):
+    client = make_client(lambda _request: json_response({}))
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        getattr(client, method)("skl_123", " ")
+
+
 def test_requests_wrap_http_errors_without_exposing_credentials():
     def handler(_request: httpx.Request) -> httpx.Response:
         return json_response({"error": {"message": "invalid sandbox token"}}, status_code=401)
@@ -259,3 +327,57 @@ def test_cli_edit_sends_partial_fields(monkeypatch, capsys):
             "lock_version": 3,
         }
     }
+
+
+def test_cli_delete_archives_skill(monkeypatch, capsys):
+    class StubClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def delete(self, identifier):
+            assert identifier == "skl_123"
+
+    monkeypatch.setattr("cli.get_client", StubClient)
+
+    delete("skl_123")
+
+    assert json.loads(capsys.readouterr().out) == {
+        "data": {"id": "skl_123", "archived": True}
+    }
+
+
+def test_cli_lists_adds_and_removes_editors(monkeypatch, capsys):
+    class StubClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def list_editors(self, identifier):
+            assert identifier == "skl_123"
+            return {"id": identifier, "editors": [], "lock_version": 1}
+
+        def add_editor(self, identifier, user):
+            assert identifier == "skl_123"
+            assert user == "editor@example.com"
+            return {"id": identifier, "editors": [{"id": "usr_456"}], "lock_version": 2}
+
+        def remove_editor(self, identifier, user):
+            assert identifier == "skl_123"
+            assert user == "usr_456"
+            return {"id": identifier, "editors": [], "lock_version": 3}
+
+    monkeypatch.setattr("cli.get_client", StubClient)
+
+    editors("skl_123")
+    assert json.loads(capsys.readouterr().out)["data"]["editors"] == []
+
+    add_editor("skl_123", "editor@example.com")
+    assert json.loads(capsys.readouterr().out)["data"]["editors"] == [{"id": "usr_456"}]
+
+    remove_editor("skl_123", "usr_456")
+    assert json.loads(capsys.readouterr().out)["data"]["editors"] == []
