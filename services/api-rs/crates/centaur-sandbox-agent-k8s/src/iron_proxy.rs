@@ -24,9 +24,8 @@ use serde_json::{Value, json};
 use tokio::time::{Instant, sleep};
 
 use crate::{
-    API_SERVER_ENABLED_LABEL, AgentSandboxBackend, LitellmEgressTarget, MANAGED_BY_LABEL,
-    MANAGED_BY_VALUE, OBSERVABILITY_ENABLED_LABEL, OtlpEgressTarget, SANDBOX_ID_LABEL,
-    is_not_found, map_kube_error,
+    AgentSandboxBackend, LitellmEgressTarget, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
+    OBSERVABILITY_ENABLED_LABEL, OtlpEgressTarget, SANDBOX_ID_LABEL, is_not_found, map_kube_error,
 };
 
 const IRON_PROXY_LABEL: &str = "centaur.ai/iron-proxy";
@@ -159,14 +158,12 @@ pub(crate) struct ResolvedIronProxy {
     // env, so it survives api-rs restarts and respects env overrides.
     management_api_key: String,
     observability_enabled: bool,
-    api_server_enabled: bool,
 }
 
 struct ResolvedIronProxyRuntime {
     pg: Option<ResolvedPg>,
     replace_placeholders: BTreeMap<String, String>,
     observability_enabled: bool,
-    api_server_enabled: bool,
 }
 
 /// The single Postgres listener the proxy multiplexes every upstream through.
@@ -231,7 +228,6 @@ impl AgentSandboxBackend {
                 pg,
                 replace_placeholders,
                 observability_enabled: spec.capabilities.observability_enabled,
-                api_server_enabled: spec.capabilities.api_server_enabled,
             },
         )))
     }
@@ -314,13 +310,6 @@ impl AgentSandboxBackend {
             "observability",
             id.as_str(),
         );
-        let api_server_enabled = resolve_resume_capability(
-            sandbox_api_server_enabled(&sandbox, &self.config.container_name),
-            sandbox.metadata.labels.as_ref(),
-            API_SERVER_ENABLED_LABEL,
-            "api_server",
-            id.as_str(),
-        );
         Ok(Some(self.resolved_iron_proxy_for_principal(
             id,
             principal_id,
@@ -330,7 +319,6 @@ impl AgentSandboxBackend {
                 pg,
                 replace_placeholders,
                 observability_enabled,
-                api_server_enabled,
             },
         )))
     }
@@ -355,7 +343,6 @@ impl AgentSandboxBackend {
             replace_placeholders: runtime.replace_placeholders,
             management_api_key: new_proxy_management_api_key(),
             observability_enabled: runtime.observability_enabled,
-            api_server_enabled: runtime.api_server_enabled,
         }
     }
 
@@ -689,24 +676,6 @@ impl AgentSandboxBackend {
                 );
                 false
             });
-        let api_server_enabled = sandbox
-            .as_ref()
-            .map(|sandbox| {
-                resolve_resume_capability(
-                    sandbox_api_server_enabled(sandbox, &self.config.container_name),
-                    sandbox.metadata.labels.as_ref(),
-                    API_SERVER_ENABLED_LABEL,
-                    "api_server",
-                    id.as_str(),
-                )
-            })
-            .unwrap_or_else(|| {
-                tracing::warn!(
-                    sandbox_id = id.as_str(),
-                    "sandbox CR missing during proxy repair; failing closed for API server network policy"
-                );
-                false
-            });
         let resolved = self.resolved_iron_proxy_for_principal(
             id,
             principal_id,
@@ -716,7 +685,6 @@ impl AgentSandboxBackend {
                 pg,
                 replace_placeholders,
                 observability_enabled,
-                api_server_enabled,
             },
         );
         self.create_iron_proxy_resources(id, Some(&resolved))
@@ -1301,11 +1269,7 @@ fn build_iron_proxy_pod(
     Pod {
         metadata: object_meta_with_annotations(
             resolved.proxy_pod_name.clone(),
-            iron_proxy_labels(
-                id,
-                resolved.observability_enabled,
-                resolved.api_server_enabled,
-            ),
+            iron_proxy_labels(id, resolved.observability_enabled),
             annotations,
         ),
         spec: Some(PodSpec {
@@ -1512,18 +1476,10 @@ fn build_iron_proxy_service(id: &SandboxId, resolved: &ResolvedIronProxy) -> Ser
     Service {
         metadata: object_meta(
             iron_proxy_service_name(id),
-            iron_proxy_labels(
-                id,
-                resolved.observability_enabled,
-                resolved.api_server_enabled,
-            ),
+            iron_proxy_labels(id, resolved.observability_enabled),
         ),
         spec: Some(ServiceSpec {
-            selector: Some(iron_proxy_labels(
-                id,
-                resolved.observability_enabled,
-                resolved.api_server_enabled,
-            )),
+            selector: Some(iron_proxy_labels(id, resolved.observability_enabled)),
             ports: Some(ports),
             ..Default::default()
         }),
@@ -1544,11 +1500,7 @@ fn build_iron_proxy_network_policies(
     let sandbox_to_proxy_ports = sandbox_to_proxy_ports(resolved);
     let mut sandbox_egress = vec![
         egress_to(
-            vec![pod_peer(iron_proxy_labels(
-                id,
-                observability_enabled,
-                resolved.api_server_enabled,
-            ))],
+            vec![pod_peer(iron_proxy_labels(id, observability_enabled))],
             sandbox_to_proxy_ports.clone(),
         ),
         dns_egress_rule(),
@@ -1586,14 +1538,10 @@ fn build_iron_proxy_network_policies(
         NetworkPolicy {
             metadata: object_meta(
                 iron_proxy_policy_name(id),
-                iron_proxy_labels(id, observability_enabled, resolved.api_server_enabled),
+                iron_proxy_labels(id, observability_enabled),
             ),
             spec: Some(NetworkPolicySpec {
-                pod_selector: Some(label_selector(iron_proxy_labels(
-                    id,
-                    observability_enabled,
-                    resolved.api_server_enabled,
-                ))),
+                pod_selector: Some(label_selector(iron_proxy_labels(id, observability_enabled))),
                 policy_types: Some(vec!["Ingress".to_owned(), "Egress".to_owned()]),
                 ingress: Some(vec![
                     NetworkPolicyIngressRule {
@@ -1857,18 +1805,6 @@ pub(crate) fn sandbox_observability_enabled(
     sandbox_env_value(
         sandbox,
         "CENTAUR_SANDBOX_OBSERVABILITY_ENABLED",
-        container_name,
-    )
-    .and_then(|value| value.parse().ok())
-}
-
-pub(crate) fn sandbox_api_server_enabled(
-    sandbox: &crate::crd::Sandbox,
-    container_name: &str,
-) -> Option<bool> {
-    sandbox_env_value(
-        sandbox,
-        "CENTAUR_SANDBOX_API_SERVER_ENABLED",
         container_name,
     )
     .and_then(|value| value.parse().ok())
@@ -2240,11 +2176,7 @@ fn sandbox_labels(id: &SandboxId) -> BTreeMap<String, String> {
     ])
 }
 
-fn iron_proxy_labels(
-    id: &SandboxId,
-    observability_enabled: bool,
-    api_server_enabled: bool,
-) -> BTreeMap<String, String> {
+fn iron_proxy_labels(id: &SandboxId, observability_enabled: bool) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::from([
         (MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned()),
         (SANDBOX_ID_LABEL.to_owned(), id.as_str().to_owned()),
@@ -2252,9 +2184,6 @@ fn iron_proxy_labels(
     ]);
     if observability_enabled {
         labels.insert(OBSERVABILITY_ENABLED_LABEL.to_owned(), "true".to_owned());
-    }
-    if api_server_enabled {
-        labels.insert(API_SERVER_ENABLED_LABEL.to_owned(), "true".to_owned());
     }
     labels
 }
@@ -2304,17 +2233,12 @@ mod tests {
             replace_placeholders: BTreeMap::new(),
             management_api_key: "test-management-key".to_owned(),
             observability_enabled: true,
-            api_server_enabled: true,
         }
     }
 
-    fn resolved_with_capabilities(
-        observability_enabled: bool,
-        api_server_enabled: bool,
-    ) -> ResolvedIronProxy {
+    fn resolved_with_observability(observability_enabled: bool) -> ResolvedIronProxy {
         ResolvedIronProxy {
             observability_enabled,
-            api_server_enabled,
             ..resolved()
         }
     }
@@ -2499,24 +2423,17 @@ mod tests {
     }
 
     #[test]
-    fn iron_proxy_labels_capabilities_when_enabled() {
+    fn iron_proxy_labels_observability_when_enabled() {
         let id = SandboxId::new("asbx-test");
 
         assert_eq!(
-            iron_proxy_labels(&id, true, true)
+            iron_proxy_labels(&id, true)
                 .get(OBSERVABILITY_ENABLED_LABEL)
                 .map(String::as_str),
             Some("true")
         );
-        assert_eq!(
-            iron_proxy_labels(&id, true, true)
-                .get(API_SERVER_ENABLED_LABEL)
-                .map(String::as_str),
-            Some("true")
-        );
-        let restricted_labels = iron_proxy_labels(&id, false, false);
+        let restricted_labels = iron_proxy_labels(&id, false);
         assert!(!restricted_labels.contains_key(OBSERVABILITY_ENABLED_LABEL));
-        assert!(!restricted_labels.contains_key(API_SERVER_ENABLED_LABEL));
     }
 
     #[test]
@@ -2621,14 +2538,6 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
-        assert_eq!(
-            pod.metadata
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get(API_SERVER_ENABLED_LABEL))
-                .map(String::as_str),
-            Some("true")
-        );
 
         let service = build_iron_proxy_service(&id, &resolved);
         assert_eq!(
@@ -2642,28 +2551,10 @@ mod tests {
         );
         assert_eq!(
             service
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get(API_SERVER_ENABLED_LABEL))
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            service
                 .spec
                 .as_ref()
                 .and_then(|spec| spec.selector.as_ref())
                 .and_then(|selector| selector.get(OBSERVABILITY_ENABLED_LABEL))
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            service
-                .spec
-                .as_ref()
-                .and_then(|spec| spec.selector.as_ref())
-                .and_then(|selector| selector.get(API_SERVER_ENABLED_LABEL))
                 .map(String::as_str),
             Some("true")
         );
@@ -2690,15 +2581,6 @@ mod tests {
         );
         assert_eq!(
             proxy_policy
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get(API_SERVER_ENABLED_LABEL))
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            proxy_policy
                 .spec
                 .as_ref()
                 .and_then(|spec| spec.pod_selector.as_ref())
@@ -2707,23 +2589,13 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
-        assert_eq!(
-            proxy_policy
-                .spec
-                .as_ref()
-                .and_then(|spec| spec.pod_selector.as_ref())
-                .and_then(|selector| selector.match_labels.as_ref())
-                .and_then(|labels| labels.get(API_SERVER_ENABLED_LABEL))
-                .map(String::as_str),
-            Some("true")
-        );
     }
 
     #[test]
-    fn iron_proxy_resources_omit_capability_labels_when_disabled() {
+    fn iron_proxy_resources_omit_observability_label_when_disabled() {
         let id = SandboxId::new("asbx-test");
         let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
-        let resolved = resolved_with_capabilities(false, false);
+        let resolved = resolved_with_observability(false);
         let sync = ProxySyncEnv {
             proxy_id: "iprx_test".to_owned(),
             control_url: "http://console:3000".to_owned(),
@@ -2742,15 +2614,12 @@ mod tests {
         );
         let pod_labels = pod.metadata.labels.as_ref().unwrap();
         assert!(!pod_labels.contains_key(OBSERVABILITY_ENABLED_LABEL));
-        assert!(!pod_labels.contains_key(API_SERVER_ENABLED_LABEL));
 
         let service = build_iron_proxy_service(&id, &resolved);
         let service_labels = service.metadata.labels.as_ref().unwrap();
         assert!(!service_labels.contains_key(OBSERVABILITY_ENABLED_LABEL));
-        assert!(!service_labels.contains_key(API_SERVER_ENABLED_LABEL));
         let service_selector = service.spec.as_ref().unwrap().selector.as_ref().unwrap();
         assert!(!service_selector.contains_key(OBSERVABILITY_ENABLED_LABEL));
-        assert!(!service_selector.contains_key(API_SERVER_ENABLED_LABEL));
 
         let policies = build_iron_proxy_network_policies(
             &id,
@@ -2765,7 +2634,6 @@ mod tests {
         let proxy_policy = &policies[1];
         let policy_labels = proxy_policy.metadata.labels.as_ref().unwrap();
         assert!(!policy_labels.contains_key(OBSERVABILITY_ENABLED_LABEL));
-        assert!(!policy_labels.contains_key(API_SERVER_ENABLED_LABEL));
         let policy_selector = proxy_policy
             .spec
             .as_ref()
@@ -2777,7 +2645,6 @@ mod tests {
             .as_ref()
             .unwrap();
         assert!(!policy_selector.contains_key(OBSERVABILITY_ENABLED_LABEL));
-        assert!(!policy_selector.contains_key(API_SERVER_ENABLED_LABEL));
     }
 
     #[test]
@@ -2853,7 +2720,6 @@ mod tests {
     fn resume_capability_prefers_valid_env_and_fails_closed_without_it() {
         let mut labels = BTreeMap::new();
         labels.insert(OBSERVABILITY_ENABLED_LABEL.to_owned(), "true".to_owned());
-        labels.insert(API_SERVER_ENABLED_LABEL.to_owned(), "true".to_owned());
 
         assert!(resolve_resume_capability(
             Some(true),
@@ -2881,27 +2747,6 @@ mod tests {
             Some(&BTreeMap::new()),
             OBSERVABILITY_ENABLED_LABEL,
             "observability",
-            "asbx-test",
-        ));
-        assert!(!resolve_resume_capability(
-            None,
-            None,
-            API_SERVER_ENABLED_LABEL,
-            "api_server",
-            "asbx-test",
-        ));
-        assert!(!resolve_resume_capability(
-            Some(false),
-            None,
-            API_SERVER_ENABLED_LABEL,
-            "api_server",
-            "asbx-test",
-        ));
-        assert!(resolve_resume_capability(
-            Some(true),
-            None,
-            API_SERVER_ENABLED_LABEL,
-            "api_server",
             "asbx-test",
         ));
     }
