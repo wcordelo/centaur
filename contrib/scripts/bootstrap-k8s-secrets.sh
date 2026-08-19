@@ -95,6 +95,11 @@ Optional LiteLLM in-cluster bootstrap (consumed when litellm.enabled=true):
                               (or GOOGLE_API_KEY) or OPENAI_API_KEY is required when
                               bootstrapping LiteLLM.
 
+Note: harness access-token modes (sandbox.codexAuthMode / claudeCodeAuthMode
+set to access_token) also need a console broker credential (openai-codex /
+anthropic-claude) created out of band with `centaur-perms broker create`;
+without it api-rs fails registration at startup. This script cannot seed it.
+See the Codex/Claude Auth Modes sections in docs/pages/deploying-in-production.mdx.
 EOF
 }
 
@@ -212,12 +217,6 @@ if secret_exists centaur-infra-env; then
   if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
     patch_data+=("\"OP_CONNECT_TOKEN\":\"$(printf '%s' "$OP_CONNECT_TOKEN" | base64 | tr -d '\n')\"")
   fi
-  # Top-up IRON_BROKER_TOKEN for clusters bootstrapped before iron-token-broker
-  # support landed. Only generated when absent so we don't rotate it out from
-  # under cached iron-proxy access tokens on every script run.
-  if ! secret_key_present IRON_BROKER_TOKEN; then
-    patch_data+=("\"IRON_BROKER_TOKEN\":\"$(rand_hex | base64 | tr -d '\n')\"")
-  fi
   # GITHUB_TOKEN for the repo-cache DaemonSet. Set whenever present so it can be
   # rotated; harmless when repoCache is disabled.
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
@@ -329,8 +328,6 @@ else
   secret_args=(
     -n "$NAMESPACE" create secret generic centaur-infra-env
     --from-literal=IRON_MANAGEMENT_API_KEY="$(rand_hex)"
-    --from-literal=IRON_BROKER_TOKEN="$(rand_hex)"
-    --from-literal=SANDBOX_SIGNING_KEY="$(rand_hex)"
     --from-literal=OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN"
     --from-literal=OP_VAULT="$OP_VAULT"
     --from-literal=SLACK_BOT_TOKEN="$SLACK_BOT_TOKEN"
