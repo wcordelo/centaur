@@ -27,7 +27,7 @@ use axum::{
     routing::{any, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use centaur_session_core::{ChatDestination, HarnessType, ThreadKey};
+use centaur_session_core::{ChatDestination, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SandboxRuntime, SessionPrincipalRegistrar,
     SessionRuntime, thread_trace_id, thread_trace_parent_span_id,
@@ -61,10 +61,10 @@ use crate::{
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
-        ExecuteSessionResponse, GithubThreadContext, HarnessAssignment,
-        InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, LinearThreadContext,
-        ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse, SessionSseEvent,
-        SlackThreadContext, stream_error_sse,
+        ExecuteSessionResponse, GithubThreadContext, InterruptSessionExecutionRequest,
+        InterruptSessionExecutionResponse, LinearThreadContext, ListWorkflowRunsQuery,
+        OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
+        stream_error_sse,
     },
 };
 
@@ -72,7 +72,6 @@ use crate::{
 pub struct AppState {
     initialized: Arc<RwLock<Option<AppRuntimeState>>>,
     metrics: PrometheusHandle,
-    codex_nanocodex_rollout_percent: u8,
     auth: ApiAuthConfig,
 }
 
@@ -89,14 +88,8 @@ impl AppState {
         Self {
             initialized: Arc::new(RwLock::new(None)),
             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
-            codex_nanocodex_rollout_percent: 0,
             auth,
         }
-    }
-
-    pub fn with_codex_nanocodex_rollout_percent(mut self, percent: u8) -> Self {
-        self.codex_nanocodex_rollout_percent = percent;
-        self
     }
 
     pub fn ready(
@@ -513,10 +506,10 @@ async fn authorize_api_request(
             .into_response();
     }
 
-    if let Some(prefix) = caller.platform_prefix()
+    if let Some(prefixes) = caller.platform_prefixes()
         && route.starts_with("/api/session/")
         && let Some(thread_key) = session_thread_key_from_request(&request)
-        && !thread_key.as_str().starts_with(prefix)
+        && !thread_key_matches_platform(prefixes, thread_key.as_str())
     {
         record_api_authentication(caller.class().as_str(), "forbidden");
         tracing::warn!(
@@ -526,7 +519,7 @@ async fn authorize_api_request(
             } else {
                 caller.identity()
             },
-            expected_thread_prefix = prefix,
+            expected_thread_prefixes = ?prefixes,
             "ingress caller denied for another platform's session"
         );
         return ApiError::Forbidden("caller is not authorized for this session".to_owned())
@@ -610,6 +603,13 @@ fn session_thread_key_from_request<B>(request: &Request<B>) -> Option<ThreadKey>
     session_thread_key_from_path(request.uri().path())
 }
 
+/// Whether an ingress caller scoped to `prefixes` may touch this session.
+/// A bot can mint several thread-key families (githubbot: `github:`,
+/// `github-manage:`, `github-review:`), so the caller carries them all.
+fn thread_key_matches_platform(prefixes: &[&str], thread_key: &str) -> bool {
+    prefixes.iter().any(|prefix| thread_key.starts_with(prefix))
+}
+
 fn session_thread_key_from_path(path: &str) -> Option<ThreadKey> {
     let rest = path.strip_prefix("/api/session/")?;
     let raw_thread_key = rest.split('/').next()?;
@@ -626,45 +626,8 @@ async fn create_or_get_session(
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let requested_harness = request.harness_type;
+    let harness_type = request.harness_type;
     let runtime = state.runtime()?;
-    let existing_rollout_harness = if requested_harness == HarnessType::Codex {
-        runtime
-            .existing_session_harness(&thread_key)
-            .await?
-            .filter(|harness| matches!(harness, HarnessType::Codex | HarnessType::Nanocodex))
-    } else {
-        None
-    };
-    let harness_type = existing_rollout_harness.clone().unwrap_or_else(|| {
-        rollout_harness_for_thread(
-            &thread_key,
-            &requested_harness,
-            state.codex_nanocodex_rollout_percent,
-        )
-    });
-    let harness_assignment = codex_nanocodex_assignment(
-        &requested_harness,
-        &harness_type,
-        state.codex_nanocodex_rollout_percent,
-    );
-    tracing::info!(
-        component = "api_server",
-        event = "session_harness_rollout_resolved",
-        thread_key = %thread_key,
-        requested_harness = %requested_harness,
-        resolved_harness = %harness_type,
-        ab_test = harness_assignment.is_some(),
-        ab_test_experiment = harness_assignment
-            .as_ref()
-            .map_or("", |assignment| assignment.experiment),
-        ab_test_cohort = harness_assignment
-            .as_ref()
-            .map_or("", |assignment| assignment.cohort.as_ref()),
-        existing_rollout_harness_preserved = existing_rollout_harness.is_some(),
-        codex_nanocodex_rollout_percent = state.codex_nanocodex_rollout_percent,
-        "resolved requested session harness"
-    );
     let on_harness_conflict = match request.on_harness_conflict {
         Some(OnHarnessConflict::Restart) => HarnessConflictPolicy::Restart,
         Some(OnHarnessConflict::Reject) | None => HarnessConflictPolicy::Reject,
@@ -674,163 +637,14 @@ async fn create_or_get_session(
             &thread_key,
             &harness_type,
             request.persona_id.as_deref(),
-            session_metadata_with_harness_assignment(request.metadata, harness_assignment.as_ref()),
+            request.metadata,
             on_harness_conflict,
         )
         .await?;
     Ok(Json(CreateSessionResponse {
         session: outcome.session,
         harness_switched: outcome.harness_switched,
-        harness_assignment,
     }))
-}
-
-const CODEX_NANOCODEX_AB_EXPERIMENT: &str = "codex_nanocodex_ab";
-
-fn codex_nanocodex_assignment(
-    requested_harness: &HarnessType,
-    cohort: &HarnessType,
-    rollout_percent: u8,
-) -> Option<HarnessAssignment> {
-    (*requested_harness == HarnessType::Codex && (1..100).contains(&rollout_percent)).then(|| {
-        HarnessAssignment {
-            experiment: CODEX_NANOCODEX_AB_EXPERIMENT,
-            requested_harness: requested_harness.clone(),
-            cohort: cohort.clone(),
-            rollout_percent,
-        }
-    })
-}
-
-fn session_metadata_with_harness_assignment(
-    metadata: Option<Value>,
-    assignment: Option<&HarnessAssignment>,
-) -> Option<Value> {
-    let Some(assignment) = assignment else {
-        return metadata;
-    };
-    let mut metadata = metadata.unwrap_or_else(|| json!({}));
-    if let Value::Object(object) = &mut metadata {
-        object.insert(
-            "harness_assignment".to_owned(),
-            json!({
-                "experiment": assignment.experiment,
-                "requested_harness": assignment.requested_harness,
-                "cohort": assignment.cohort,
-                "rollout_percent": assignment.rollout_percent,
-            }),
-        );
-    }
-    Some(metadata)
-}
-
-fn rollout_harness_for_thread(
-    thread_key: &ThreadKey,
-    requested_harness: &HarnessType,
-    nanocodex_percent: u8,
-) -> HarnessType {
-    if *requested_harness != HarnessType::Codex || nanocodex_percent == 0 {
-        return requested_harness.clone();
-    }
-    if nanocodex_percent >= 100 {
-        return HarnessType::Nanocodex;
-    }
-
-    let digest = Sha256::digest(thread_key.as_str().as_bytes());
-    let bucket = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
-    let threshold = (u64::from(nanocodex_percent) * (u64::from(u32::MAX) + 1)) / 100;
-    if u64::from(bucket) < threshold {
-        HarnessType::Nanocodex
-    } else {
-        HarnessType::Codex
-    }
-}
-
-#[cfg(test)]
-mod harness_rollout_tests {
-    use super::*;
-
-    #[test]
-    fn codex_rollout_is_sticky_and_split_by_thread_key() {
-        let codex_thread = ThreadKey::try_from("slack:C1:1700000000.000100".to_owned()).unwrap();
-        let nanocodex_thread =
-            ThreadKey::try_from("slack:C1:1700000000.000104".to_owned()).unwrap();
-
-        assert_eq!(
-            rollout_harness_for_thread(&codex_thread, &HarnessType::Codex, 50),
-            HarnessType::Codex
-        );
-        assert_eq!(
-            rollout_harness_for_thread(&nanocodex_thread, &HarnessType::Codex, 50),
-            HarnessType::Nanocodex
-        );
-        assert_eq!(
-            rollout_harness_for_thread(&nanocodex_thread, &HarnessType::Codex, 50),
-            HarnessType::Nanocodex
-        );
-    }
-
-    #[test]
-    fn codex_rollout_honors_boundaries_and_other_harnesses() {
-        let thread_key = ThreadKey::try_from("cli:rollout-boundaries".to_owned()).unwrap();
-
-        assert_eq!(
-            rollout_harness_for_thread(&thread_key, &HarnessType::Codex, 0),
-            HarnessType::Codex
-        );
-        assert_eq!(
-            rollout_harness_for_thread(&thread_key, &HarnessType::Codex, 100),
-            HarnessType::Nanocodex
-        );
-        assert_eq!(
-            rollout_harness_for_thread(&thread_key, &HarnessType::ClaudeCode, 50),
-            HarnessType::ClaudeCode
-        );
-        assert_eq!(
-            rollout_harness_for_thread(&thread_key, &HarnessType::Nanocodex, 50),
-            HarnessType::Nanocodex
-        );
-    }
-
-    #[test]
-    fn codex_rollout_is_balanced_across_many_thread_keys() {
-        let nanocodex = (0..10_000)
-            .filter(|index| {
-                let thread_key = ThreadKey::try_from(format!("cli:rollout-{index}")).unwrap();
-                rollout_harness_for_thread(&thread_key, &HarnessType::Codex, 50)
-                    == HarnessType::Nanocodex
-            })
-            .count();
-
-        assert!(
-            (4_900..=5_100).contains(&nanocodex),
-            "nanocodex={nanocodex}"
-        );
-    }
-
-    #[test]
-    fn codex_rollout_assignment_is_explicit_and_persistable() {
-        let assignment =
-            codex_nanocodex_assignment(&HarnessType::Codex, &HarnessType::Nanocodex, 50).unwrap();
-        let metadata = session_metadata_with_harness_assignment(
-            Some(json!({"source": "slackbotv2"})),
-            Some(&assignment),
-        )
-        .unwrap();
-
-        assert_eq!(assignment.experiment, CODEX_NANOCODEX_AB_EXPERIMENT);
-        assert_eq!(assignment.cohort, HarnessType::Nanocodex);
-        assert_eq!(
-            metadata.pointer("/harness_assignment/cohort"),
-            Some(&json!("nanocodex"))
-        );
-        assert_eq!(metadata.get("source"), Some(&json!("slackbotv2")));
-        assert!(codex_nanocodex_assignment(&HarnessType::Codex, &HarnessType::Codex, 0).is_none());
-        assert!(
-            codex_nanocodex_assignment(&HarnessType::Nanocodex, &HarnessType::Nanocodex, 50)
-                .is_none()
-        );
-    }
 }
 
 async fn get_session_context(
@@ -1073,7 +887,36 @@ fn principal_subject_owns_session(subject: Option<&str>, session_principal: Opti
 
 #[cfg(test)]
 mod session_authorization_tests {
-    use super::principal_subject_owns_session;
+    use super::{principal_subject_owns_session, thread_key_matches_platform};
+
+    #[test]
+    fn ingress_scope_covers_every_family_the_bot_mints() {
+        let github = [
+            "github:",
+            "github-issue:",
+            "github-manage:",
+            "github-review:",
+        ];
+        assert!(thread_key_matches_platform(&github, "github:acme/repo:12"));
+        assert!(thread_key_matches_platform(
+            &github,
+            "github-issue:acme/repo:12"
+        ));
+        assert!(thread_key_matches_platform(
+            &github,
+            "github-manage:acme/repo:12"
+        ));
+        assert!(thread_key_matches_platform(
+            &github,
+            "github-review:acme/repo:12"
+        ));
+        assert!(!thread_key_matches_platform(&github, "slack:C123:1.2"));
+        // `github-anything:` outside the listed families stays denied.
+        assert!(!thread_key_matches_platform(
+            &github,
+            "githubx:acme/repo:12"
+        ));
+    }
 
     #[test]
     fn principal_session_reads_require_exact_persisted_owner() {
