@@ -123,9 +123,9 @@ git diff --check
 ## Sync from upstream (fork workflow)
 
 This checkout is a fork of [`paradigmxyz/centaur`](https://github.com/paradigmxyz/centaur).
-`origin` points at the fork; upstream is the canonical open-source repo. At the start
-of a new agent session (or before picking up stale work), sync local `main` with
-upstream and push the result back to the fork so `origin/main` stays current.
+`origin` points at the fork; upstream is the canonical open-source repo. Use this
+workflow only when the task requests upstream synchronization. A new session or
+stale checkout alone does not authorize a merge or push.
 
 ```bash
 just sync-upstream          # fetch + merge upstream/main (adds upstream remote if needed)
@@ -146,8 +146,10 @@ just sync-upstream --dry-run      # preview commands
 Override defaults with `CENTAUR_UPSTREAM_URL`, `CENTAUR_UPSTREAM_REMOTE`, or
 `CENTAUR_UPSTREAM_BRANCH` when needed.
 
-If the merge conflicts, resolve files, commit the merge, then push. Common overlap
-with fork-only customizations includes `services/slackbotv2/src/server.ts`,
+If the task authorizes publication and the merge conflicts, resolve files, commit
+the merge, then push. Preserve unrelated changes in an isolated worktree and stop
+when the correct resolution is unclear. Common overlap with fork-only customizations
+includes `services/slackbotv2/src/server.ts`,
 `services/sandbox/entrypoint.sh` / `SYSTEM_PROMPT.md` (Active deployment block),
 LiteLLM/host-egress network policy in `centaur-sandbox-agent-k8s`, and
 `quickBaseDomain` / Quick deploy cards in slackbotv2.
@@ -193,12 +195,16 @@ scoped access.
 
 ## Canonical references
 
+- `docs/pages/capabilities.mdx`: full platform capability inventory for
+  agents and operators (ingresses, console, MCP, connectors, permissions,
+  tools, workflows, chart toggles).
 - `README.md` and `docs/pages/architecture.mdx`: system overview.
 - `docs/pages/quickstart.mdx`: local stack and end-to-end smoke path.
 - `contrib/chart/values.yaml`: supported deployment configuration.
 - Service `README.md` files, where present: behavior and environment variables.
 - `services/api-rs/rfcs/`: control-plane and sandbox design contracts.
 
-"Chat SDK" means the Vercel Chat SDK. When adapter behavior matters, inspect
-the source checkout at `~/github/vercel/chat` rather than generated files under
-`node_modules`.
+"Chat SDK" means the Vercel Chat SDK. When adapter behavior matters, inspect the
+source checkout at `~/github/vercel/chat` if it exists; otherwise use the repository's
+implementation, tests, and package documentation and report the external checkout
+as unavailable. Do not block unrelated work on that optional checkout.
