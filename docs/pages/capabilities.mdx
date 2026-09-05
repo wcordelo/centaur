@@ -1,0 +1,778 @@
+---
+title: Centaur Capabilities
+description: Comprehensive inventory of Centaur platform capabilities for operators and coding agents.
+---
+
+# Centaur Capabilities
+
+This document inventories Centaur capabilities and their configuration points. Use it as
+context for coding agents, deployment planning, feature enablement, and
+reviews. Prefer the live repo (`contrib/chart/values.yaml`, service guides,
+and tool `pyproject.toml` files) when a setting or tool may have changed.
+
+Canonical companions:
+
+- [What is Centaur?](./what-is-centaur.mdx)
+- [Architecture](./architecture.mdx)
+- [Security](./security.mdx)
+- [Configuration reference](./reference/configuration.mdx)
+- [Tool directory](./reference/tool-directory.mdx)
+- [Per-user permissions](./secrets/advanced-permissioning.mdx)
+- [OAuth apps](./secrets/oauth-apps.mdx)
+- [Overlays](./extend/overlay.mdx)
+- Repo root `AGENTS.md` and nearest service `AGENTS.md`
+
+---
+
+## 1. What Centaur is
+
+Centaur is a **self-hosted control plane for shared AI agents**. Teams talk to
+one agent from Slack (or other chat surfaces / the API). Centaur:
+
+1. Verifies and normalizes the platform event.
+2. Creates or reuses a durable **session**.
+3. Appends the user message, starts an **execution**, and streams
+   **replayable events**.
+4. Assigns an isolated **Kubernetes sandbox** running a selected **harness**.
+5. Lets the agent use **approved tools** and **skills** without raw long-lived
+   secrets in the sandbox.
+6. Injects credentials at the network edge via **iron-proxy**.
+7. Renders progress and the final answer back to the originating platform.
+
+It is built for recoverable, auditable, multi-user agent work — not one-off
+local chat loops.
+
+### What it is good for
+
+- Investigating CI failures and production issues with a real shell + repo
+- Answering questions with internal tools and indexed company context
+- Summarizing Slack threads / customer context
+- Recurring digests, monitors, and multi-step operational workflows
+- Standardizing harness + tool behavior across a team
+- Giving agents GitHub / Linear / CRM / analytics access without shipping keys
+  into the sandbox
+
+### What it is not
+
+- Not a hosted SaaS product (you run it on your Kubernetes)
+- Not an in-memory demo chatbot (state lives in Postgres)
+- Not a full internal PaaS yet — **Apps** are design-only (see §13)
+- Not a first-class “Guest role” product — guest/Connect access is modeled via
+  allowlists, channel principals, and RLS (see §7)
+
+---
+
+## 2. Architecture planes
+
+| Plane | Responsibility | Main components |
+|-------|----------------|-----------------|
+| **Ingress** | Accept user/client input | `slackbotv2`, `discordbot`, `githubbot`, `linearbot`, `teamsbot`, external API clients |
+| **Control** | Persist requests, coordinate runtime | `api-rs`, Postgres, session + workflow runtime |
+| **Execution** | Run one assigned agent session | Kubernetes sandbox pods, `harness-server` |
+| **Capabilities** | Approved actions | Tool plugins (`tools/`), workflows (`workflows/`), skills (`.agents/skills/`), overlays |
+| **Secrets & egress** | Creds without raw keys in sandbox | Console (iron-control), iron-proxy, secret backends |
+| **Operator UI** | Humans manage grants, connectors, sessions | Console (Rails), optional PWA |
+
+### Request path (durable)
+
+```text
+Chat / API / MCP
+    → api-rs session API
+    → Postgres (sessions, messages, executions, events)
+    → K8s sandbox + harness
+    → tool CLIs / workflows
+    → iron-proxy (credential injection)
+    → upstream APIs
+    → event stream → ingress renders to platform
+```
+
+### Core session API
+
+| Step | Endpoint |
+|------|----------|
+| Create / reuse session | `POST /api/session/{thread_key}` |
+| Persist user turn | `POST /api/session/{thread_key}/messages` |
+| Start agent | `POST /api/session/{thread_key}/execute` |
+| Stream / replay | `GET /api/session/{thread_key}/events` |
+| Interrupt | `POST /api/session/{thread_key}/interrupt` |
+| Inspect session | `GET /api/session/{thread_key}` |
+
+Clients should reconnect with `after_event_id` rather than reconstructing
+state locally.
+
+Other important API surfaces:
+
+- **MCP:** `POST/GET /mcp`, OAuth protected-resource metadata
+- **Slack proxies:** `/api/slack/files`, `/upload`, `/{id}/download|info`,
+  `/channels`, `/{id}/history`, `/members`, `/threads/.../replies`
+- **Workflows:** schedules, runs, cancel, events, webhooks
+- **Personas:** `GET /api/personas`
+- **Admin ETL:** Slack archive imports, Slack DM sync, Google docs sync helpers
+- **Health:** `/healthz`, `/readyz`, `/metrics`
+
+---
+
+## 3. Chat ingresses
+
+All ingresses are **thin adapters**: verify platform events → call durable
+session API → render output. Do not put orchestration logic in bots.
+
+| Service | Chart key | Default | Capabilities |
+|---------|-----------|---------|--------------|
+| **slackbotv2** | `slackbotv2.enabled` | On | Mentions & threads → sessions; stop commands; harness/model flags (`--claude`, `--codex`, `--amp`, `--meta`, `--bedrock`, reasoning flags); Console thread links; MCP URL in setup; external-org & trigger-bot allowlists; Slack Connect file repair paths |
+| **discordbot** | `discordbot.enabled` | Off | @mention → thread; Gateway singleton; guild allowlist fail-closed; no DMs |
+| **githubbot** | `githubbot.enabled` | Off | Comment threads; PR review requests; issue assignment → implement + PR; auto-merge/hold; prompt overrides |
+| **linearbot** | `linearbot.enabled` | Off | Comment threads; issue assign/delegate; status markers (not Linear native agent widgets) |
+| **teamsbot** | `teamsbot.enabled` | Off | Bot Framework activities; team/channel/tenant allowlists; mention-gated |
+
+Slack-specific policy knobs:
+
+- `slackbotv2.externalOrgAllowlist` — Slack team IDs allowed for external org /
+  Slack Connect handoff
+- `slackbotv2.triggerBotAllowlist` — bot-authored triggers
+- `slackbotv2.mcpPublicUrl` — advertised MCP URL (fallback for `apiRs.mcpPublicUrl`)
+
+---
+
+## 4. Sandboxes and harnesses
+
+### Runtime model
+
+- Backend: `apiRs.sandboxBackend: agent-k8s` (default; do not plan new
+  deployments on a local-container backend)
+- Warm pool, running limit, hot-idle grace, max lifetime reaper, and cleanup
+  worker are chart-driven (`apiRs.sandboxWarmPoolSize`,
+  `sandboxRunningLimit`, `sandboxMaxLifetimeSecs`, etc.)
+- Sandboxes speak a stable Anthropic-style message format to the API;
+  harness quirks stay inside the adapter
+
+### Harnesses
+
+| Harness | Chart / flag | Notes |
+|---------|--------------|-------|
+| **Codex** | `sandbox.harnessEngine: codex` (default) | App-server + blocks; providers include OpenAI, OpenRouter, Bedrock, Meta (`--meta`); model and reasoning defaults come from deployment configuration; auth `api_key` or `access_token` (brokered ChatGPT) |
+| **Claude Code** | `claudecode` | Anthropic CLI via harness-server; `api_key` or `access_token` |
+| **Amp** | `amp` | Amp JSON-RPC |
+
+Auth modes: `sandbox.codexAuthMode` / `sandbox.claudeCodeAuthMode` =
+`api_key` | `access_token`.
+
+### Sandbox contents (typical)
+
+- Shell, git, Python, Node.js, Bun, common dev tools
+- Tool CLI shims installed from `TOOL_DIRS` / overlay sources
+- Skills copied from `CENTAUR_SKILL_DIRS`
+- Proxy CA and proxy settings for egress
+- **No** Kubernetes service-account tokens and **no** long-lived third-party
+  API keys as env values (placeholders only)
+
+### Per-principal sandbox capabilities
+
+Configurable per principal in Console (and as deployment defaults in
+**Settings**):
+
+| Flag | Values / meaning |
+|------|------------------|
+| `sandbox_repo_cache` | `none` \| `public` \| `all` — visibility of overlay/repo-cache checkouts |
+| `sandbox_observability_enabled` | NetworkPolicy egress to logs/metrics collectors |
+| `sandbox_api_server_enabled` | Sandbox may call api-rs (required for Slack proxies / JWT-gated API routes) |
+
+Deployment-wide defaults for **new** principals live under Console → Settings
+(`default_sandbox_repo_cache`, `default_sandbox_observability_enabled`,
+`default_sandbox_api_server_enabled`).
+
+---
+
+## 5. Console (operator & member UI)
+
+The Console is a Rails app (historically iron-control). It is the credential
+control plane **and** the human UI for sessions, workflows, connectors, and
+MCP OAuth.
+
+Enable: `console.enabled: true`. Set `console.publicUrl` for MCP issuer
+metadata, OAuth callbacks, and Slack → Console thread links.
+
+### Surfaces
+
+| Surface | Audience | Capability |
+|---------|----------|------------|
+| **Control** — Principals, Roles, Secrets, Credentials, OAuth Apps, Users | Admin | Full credential plane |
+| **Settings** | Admin | Default sandbox capabilities for new principals |
+| **Data Sync / ETLs** | Admin | Slack archive imports and ETL ops |
+| **Integrations** | Any signed-in user | Self-serve OAuth connect (Google, Slack, GitHub, Granola, Linear, Attio) |
+| **Workflows** | Signed-in | List, filter, force-start, inspect durable runs |
+| **Threads / Chats** | Signed-in | Read-only session browser; thinking traces; split view (up to 4 threads) |
+| **PWA** | Browser | Installable web app; shortcuts to Threads / Workflows / Integrations; `web+centaur` protocol |
+
+### Auth
+
+- Email/password bootstrap via `CENTAUR_CONSOLE_INITIAL_USER_*`
+- Optional Google SSO (`console.googleOauth`)
+- Optional Slack OIDC SSO (`console.slackOauth`)
+- `CENTAUR_CONSOLE_BOOTSTRAP_ADMINS` email allowlist for first-login admins
+- Admin can “descope” to view as operator
+
+### JSON API
+
+Console exposes `/api/v1/*` for secrets, principals, grants, and
+`POST /api/v1/proxy/sync` (iron-proxy config sync). See
+`services/console/docs/API.md`.
+
+---
+
+## 6. Credential-safe automation (iron-proxy)
+
+### Model
+
+1. Tools and harnesses refer to credentials by **name** / placeholders.
+2. The sandbox only holds placeholders.
+3. iron-proxy loads principal config from Console.
+4. On matching outbound requests (host / method / path / headers), the proxy
+   injects the real credential.
+
+### Console objects
+
+| Object | Role |
+|--------|------|
+| **Principal** | Identity a session/proxy runs as |
+| **Role** | Bundle of secrets (`infra`, `tools`, `tool-<slug>`, `user-mcp`, custom) |
+| **Grant** | Secret → principal or role, with request rules |
+| **Secret / Credential** | Typed secret record (static, OAuth, AWS, GCP, PG DSN, HMAC, token_broker, …) |
+| **Proxy** | Registers and syncs config for a principal |
+
+### Principal ID shapes
+
+| Context | Foreign id |
+|---------|------------|
+| Slack user | `slack-user-[<team-id-slug>-]<user-id-slug>` |
+| Slack channel | `slack-channel-[<team-id-slug>-]<channel-id-slug>` |
+| Discord channel | `discord-channel-<guild-id>-<channel-id>` |
+| Teams user | `teams-user-<tenant-id-slug>-<user-id-slug>` |
+| Teams conversation | `teams-conversation-<tenant-id-slug>-<conversation-id-slug>` |
+| Console / MCP user | `console-user-…` |
+
+Channel grants are shared by everyone in that channel. DMs / one-person runs
+normally use the user principal.
+
+### Operator CLI
+
+`centaur-perms` (from `services/api-rs`) scripts grants:
+
+```bash
+cargo run -p centaur-perms -- principals grant slack-user-u123 --tool github
+cargo run -p centaur-perms -- principals grant slack-channel-c456 --role tool-linear
+cargo run -p centaur-perms -- principals show slack-user-u123
+```
+
+Requires `IRON_CONTROL_URL`, `IRON_CONTROL_API_KEY`, `IRON_CONTROL_NAMESPACE`,
+and `TOOL_DIRS`.
+
+### Secret source policies
+
+| Policy | Behavior |
+|--------|----------|
+| `env` | Resolve from environment |
+| `onepassword` | 1Password service account |
+| `onepassword-connect` | 1Password Connect (common in-cluster) |
+
+Also documented: AWS KMS / GCP Secret Manager patterns for other deployments.
+Chart: `ironProxy.secretSource`, `ironProxy.upstreamDenyCidrs` (deny IMDS /
+cluster CIDRs).
+
+### OAuth broker credentials
+
+OAuth apps registered in Console create broker credentials. Consent mints a
+grantable static secret with `token_broker` source. Console worker refreshes
+tokens; refresh tokens never leave Console. Grant the wrapper secret to users,
+channels, or roles like any other secret.
+
+---
+
+## 7. Permissions (Slack channels, DMs, guests)
+
+### Tool / credential permissions
+
+Effective access = **direct grants ∪ role grants**. Standard roles:
+
+- `infra` — platform/infra secrets
+- `tools` — broad tools package (deployment-defined)
+- `tool-<slug>` — one role per tool (e.g. `tool-github`)
+- `user-mcp` — default role for MCP Console principals
+
+### Slack channel & DM permissions
+
+Per principal, Console stores rows with:
+
+- `upload_enabled`
+- `download_enabled`
+- `history_enabled`
+
+for specific Slack channel IDs (including DM `D…` IDs). These are seeded /
+upserted during session registration and feed JWT / Slack-proxy auth when
+`sandbox_api_server_enabled` is on.
+
+Use channel principals when an **incident channel** or **shared room** should
+define the authorization boundary for everyone in it.
+
+### Guest / external access (no Guest role)
+
+There is **no** first-class “Guest” principal type. Closest controls:
+
+1. **`slackbotv2.externalOrgAllowlist`** — allow listed Slack team IDs for
+   Slack Connect / external-org mentions
+2. **Channel / DM permission rows** — what Slack data a principal may
+   upload/download/history
+3. **RLS on DM / ETL tables** — `centaur_readonly` and Slack-identity gating so
+   users only see permitted DM/private data
+4. **Principal grants** — which tools/secrets that identity may use
+
+### Sandbox capability permissions
+
+See §4 (`sandbox_repo_cache`, observability, api-server).
+
+---
+
+## 8. MCP (Model Context Protocol)
+
+Centaur can expose tools to external MCP clients (Amp, Codex, VS Code, etc.).
+
+| Piece | Owner | Detail |
+|-------|-------|--------|
+| Resource server | api-rs | `POST/GET /mcp`; OAuth protected-resource metadata |
+| Auth server | Console | Dynamic client registration, authorize, token; scope `mcp:tools` |
+| Runtime | Per-principal MCP tool-host sandboxes | Tools execute with that Console user’s grants |
+| Default role | `user-mcp` | Seeded on new MCP principals; admins grant tools onto it |
+| Labels | Slack SSO | Console users labeled with Slack team/user when SSO present |
+
+**Enable:** set `apiRs.mcpPublicUrl` and/or `slackbotv2.mcpPublicUrl`, and
+`console.publicUrl`. Users SSO into Console and approve the MCP client.
+
+Design contract: `services/api-rs/rfcs/0004-console-mcp-jwt-auth.md`.
+
+Granola tool can also speak Granola’s own MCP host (`mcp.granola.ai`) with
+REST fallback.
+
+---
+
+## 9. Data connectors, OAuth Integrations, and ETL
+
+### Two related concepts
+
+1. **Integrations (user OAuth)** — Console → Integrations; users connect
+   personal/workspace accounts. Tokens become grantable broker credentials.
+2. **ETL workflows** — scheduled durable jobs that sync upstream data into
+   Postgres for search via `company_context` (and operator analytics).
+
+### Supported OAuth providers (Console OAuth Apps)
+
+| Provider | Typical use |
+|----------|-------------|
+| `google` | Gmail, Drive, Docs, Calendar, etc. |
+| `slack` | User tokens; DM sync |
+| `github` | `api.github.com` |
+| `granola` | Granola MCP / notes |
+| `linear` | `api.linear.app` |
+| `attio` | `api.attio.com` |
+
+Consent URL shape: `<CENTAUR_CONSOLE_PUBLIC_URL>/oauth/<slug>/start`.
+
+### ETL / sync workflows
+
+| Workflow | Purpose | Enable |
+|----------|---------|--------|
+| `slack_sync` | Incremental channel history sync | `apiRs.etl.slack.enabled` |
+| `slack_backfill` | Drain historical backfill jobs | (with Slack ETL) |
+| `slack_retention` | Retention policy | (with Slack ETL) |
+| `slack_archive_import` | Import archive ZIPs via Console ETLs | Console Data Sync |
+| Granola Console sync jobs | Notes + transcripts → Postgres | Console OAuth credential and recurring jobs |
+| `attio_sync` | Meetings + call transcripts → Postgres | `ATTIO_ETL_ENABLED` |
+| `linear_sync` | Projects / issues / comments | `apiRs.etl.linear.enabled` |
+| `google_drive_sync` | Drive/docs sync | `apiRs.etl.googleDrive.enabled` |
+| `google_calendar_sync` | Calendar sync | `apiRs.etl.googleCalendar.enabled` |
+| `company_context_documents` | Project synced sources into searchable docs | `apiRs.etl.companyContextDocuments.enabled` (default on) |
+
+Slack ETL details:
+
+- Uses dedicated `SLACK_ETL_TOKEN` (user token), separate from live Slackbot
+- Public channels by default; set `apiRs.etl.slack.indexPrivateChannels: true`
+  for private channels visible to that token
+- Does **not** sync DMs (DM sync is a separate Console path)
+- Optional attachment download with size limits
+- Private channel / DM rows protected by RLS
+
+Slack **DM sync**: Console worker + user OAuth app (`console.slackDmSync.oauthAppSlug`);
+api-rs admin routes for batch/checkpoints; readonly access gated by Slack
+identity.
+
+### Agent-facing retrieval
+
+Tool: **`company_context`** — search indexed company history, visible Slack
+DMs, Google Docs, Calendar, Linear, Attio projections, etc. Prefer this over
+ad-hoc Slack/Drive search for historical questions when ETL is enabled.
+
+---
+
+## 10. Tools catalog
+
+Tools are independently packaged Python CLIs under `tools/`. Each declares
+`[tool.centaur]` secrets/hosts. api-rs discovers metadata for grants; sandbox
+startup installs `[project.scripts]` as local shims.
+
+**Discover in a live sandbox:**
+
+```bash
+centaur-tools list
+# or agent-facing helpers:
+call tools
+call discover linear
+```
+
+Repo inventory ≠ live deployment. Only tools with credentials granted to the
+active principal are useful.
+
+### Productivity
+
+| Tool | Use |
+|------|-----|
+| `linear` | Issues, projects, cycles, teams, labels |
+| `notion` | Pages, databases, blocks, comments |
+| `slack` | Messages, files, channels, threads, users (prefer API proxies when enabled) |
+| `gsuite` | Gmail, Calendar, Drive, Docs, Sheets, Slides, Analytics |
+| `granola` | Notes and transcripts (MCP + REST) |
+| `company_context` | Indexed company history search |
+| `figma` | Files, nodes, components, styles, variables |
+| `airtable` | Bases, tables, records, views |
+| `composio` | Third-party tools via Composio |
+| `opentable` | Restaurant search |
+
+### Business
+
+| Tool | Use |
+|------|-----|
+| `attio` | CRM objects, records, lists, notes, tasks, calls, meetings |
+| `ashby` | ATS candidates, jobs, applications, interviews |
+| `pylon` | Support issues, accounts, contacts, teams |
+
+### Communications
+
+| Tool | Use |
+|------|-----|
+| `telegram` | Bot messages, chats, webhooks |
+| `twitter` | X/Twitter via Synoptic |
+| `discord` | Discord integrations |
+| `synoptic` | Synoptic API (Twitter/X data plane) |
+
+### Infrastructure & observability
+
+| Tool | Use |
+|------|-----|
+| `grafana` | Dashboards, alerts, VictoriaMetrics/Logs, annotations |
+| `posthog` | Product analytics / HogQL |
+| `amplitude` | Event segmentation, funnels, retention |
+| `sentry` | Error tracking |
+| `cloudwatch` | AWS CloudWatch |
+| `vlogs` | VictoriaLogs queries |
+| `vmetrics` | VictoriaMetrics PromQL/MetricsQL |
+| `chart` | Render charts as PNG for Slack/reports |
+| `quick` | Zero-friction static HTML/JS/CSS site deploy |
+| `laminar` | Laminar observability |
+| `centaur-investigator` | Investigate Centaur threads/sessions (readonly Postgres) |
+| `demo` | Tool plumbing smoke |
+| `profslice` | Firefox Profiler extraction |
+| `reth` / `reth-log-analyzer` | Reth performance metrics and log graphs |
+
+### Media
+
+| Tool | Use |
+|------|-----|
+| `nano-banana` | Gemini image generation/editing |
+| `veo3` | Veo 3 video generation |
+| `transcriber` | Local Whisper transcription helpers |
+
+### Research
+
+| Tool | Use |
+|------|-----|
+| `websearch` | Web search + deep research |
+| `crunchbase` | Company / funding data |
+| `harmonic` | Startup discovery / enrichment |
+| `youtube` | Video, channel, transcript, search |
+| `newsapi` | Headlines and article search |
+| `googlenews` | Google News |
+| `congress` / `openfec` / `fedreg` / `legistorm` / `plural` | Gov / legislative data |
+| `archiver` / `docsend` | Document extraction / DocSend |
+| `listennotes` | Podcast search |
+| `sensortower` / `similarweb` | App and web analytics |
+| `preqin` | Preqin research data |
+
+### Crypto / markets
+
+| Tool | Use |
+|------|-----|
+| `mpp` | Paid MPP requests + **service discovery** (`mpp services search\|list\|show`) |
+| `dune` | Dune query execution |
+| `nansen` | Smart-money / wallet analytics |
+| `alchemy` / `etherscan` / `tenderly` | Chain data, simulation, tracing |
+| `arkham` / `debank` / `allium` / `defillama` | Onchain intelligence / DeFi |
+| `coingecko` / `coinmetrics` / `messari` / `token-terminal` / `tokenomist` | Market / protocol metrics |
+| `polymarket` / `kalshi` | Prediction markets |
+| `snapshot` / `tally` / `karma` | Governance |
+| `databento` / `eodhd` / `standard-metrics` | Markets / portfolio metrics |
+| `coindesk` / `theblock` | Crypto news |
+
+### Persona tools
+
+| Tool | Use |
+|------|-----|
+| `eng` | Engineering persona for code review / debugging / repo work |
+
+Overlays can add or replace any tool name (later sources shadow earlier).
+
+---
+
+## 11. Workflows
+
+Durable Python handlers under `workflows/`, executed by
+`services/workflow-python` under api-rs’s Absurd workflow runtime.
+Checkpoints survive restarts (`ctx.step(...)`). Can sleep, wait for events,
+start child workflows, call tools, and run agent turns.
+
+Policy: `apiRs.workflowEnableMode` (`all` or `allowlist`) +
+`workflowAllowedNames`.
+
+### Shipped workflows
+
+| Name | Purpose |
+|------|---------|
+| `slack_sync` | Incremental Slack channel sync |
+| `slack_backfill` | Historical Slack backfill worker |
+| `slack_retention` | Slack data retention |
+| `slack_archive_import` | Slack export ZIP import |
+| `attio_sync` | Attio meetings/calls ingest |
+| `linear_sync` | Linear ETL |
+| `google_drive_sync` | Google Drive ETL |
+| `google_calendar_sync` | Google Calendar ETL |
+| `company_context_documents` | Project ETL rows → searchable documents |
+| `github_issue_triage` | GitHub webhook → agent triage comment |
+| `muesli_meeting_ingest` | Local laptop meeting transcript hook |
+| `echo` | Dev echo |
+| `api_rs_python_host_smoke` | Host smoke test |
+
+Console **Workflows** UI can list, force-start, and debug runs.
+
+Docs: [Creating Workflows](./extend/workflows.mdx),
+[Workflows v2](./extend/workflows-v2.mdx).
+
+---
+
+## 12. Skills
+
+Skills are reusable instruction packs (`SKILL.md`) for sandbox agents — not
+network-granting tools. Loaded from `CENTAUR_SKILL_DIRS` / overlay
+`.agents/skills/`.
+
+### Skills shipped in the base repo
+
+| Skill | Typical use |
+|-------|-------------|
+| `company-context` | How to search and cite indexed company context |
+| `qa` | QA playbook |
+| `dogfood` | Dogfooding Centaur |
+| `deploying-static-sites` | Static site deploy via `quick` |
+| `harness-development` | Working on harness adapters |
+| `creating-tools` | Authoring new tool plugins |
+| `run-centaur-dev` | Local Centaur development |
+| `tool-health-smoke` | Tool health checks |
+| `learning-synthesis` | Learning synthesis patterns |
+| `improve-gap-task` | Gap-task improvement loop |
+| `auth-failure-log-triage` | Triage auth failures in logs |
+
+Org-specific skills belong in an overlay.
+
+---
+
+## 13. Overlays and extension model
+
+### Overlays (production)
+
+Ordered Git sources in Helm:
+
+```yaml
+overlays:
+  sources:
+    - repo: paradigmxyz/centaur
+      ref: main
+      visibility: public
+    - repo: your-org/centaur-overlay
+      ref: main
+      visibility: private
+```
+
+Repo-cache DaemonSet checks out each source. Later sources **shadow** earlier
+ones on name collisions. Overlay layout typically includes:
+
+```text
+tools/
+workflows/
+.agents/skills/
+services/sandbox/SYSTEM_PROMPT.md   # optional prompt overlay
+```
+
+### Personas
+
+API-discoverable personas (`GET /api/personas`); can be extended via overlays
+/ persona tools.
+
+### Quick static hosting (optional)
+
+Chart `quick.enabled` + `quick` tool for deploying agent-built static sites to
+a configured base domain.
+
+### LiteLLM (optional)
+
+Chart `litellm.enabled` for an optional model gateway.
+
+### Apps / internal PaaS (not production)
+
+Documented design for versioned app repos that deploy web + tools + workflows
+beside the control plane ([Apps](./extend/apps.mdx)). **Not implemented for
+production** — do not plan against it as shipped.
+
+---
+
+## 14. Security boundaries (summary)
+
+**Protects against:**
+
+- Raw long-lived secrets sitting in sandbox env/files (placeholders + proxy)
+- Unscoped credential use (grants + request rules)
+- Casual IMDS / cluster-CIDR egress (`upstreamDenyCidrs`)
+- Cross-user DM / private ETL reads (RLS + Slack identity)
+
+**Does not mean:**
+
+- Agents are powerless — a granted tool can call its APIs
+- Sandbox shell is locked down like a browser sandbox — agents have a real
+  workspace
+- Every chat user automatically gets every tool — grants must be configured
+
+Full threat model: [Security](./security.mdx).
+
+---
+
+## 15. Local development & operations
+
+Primary commands (from repo root; verify `kubectl` context first):
+
+```bash
+just up          # build and start local stack
+just deploy      # update Helm release
+just status
+just logs <component>
+just sync-upstream   # fork workflow: merge upstream/main
+```
+
+Slack local runbook: [local-slack-dev](/md/local-slack-dev.md).
+
+Useful validation:
+
+```bash
+pnpm install --frozen-lockfile
+helm lint contrib/chart
+python scripts/validate_cli_packaging.py
+git diff --check
+```
+
+Python tooling uses `uv` and targets 3.11+.
+
+---
+
+## 16. Helm feature toggles (quick reference)
+
+File: `contrib/chart/values.yaml`.
+
+| Key | Turns on |
+|-----|----------|
+| `console.enabled` + `console.publicUrl` | Operator UI, MCP issuer, Integrations, thread links |
+| `console.googleOauth` / `slackOauth` | Console SSO |
+| `apiRs.mcpPublicUrl` / `slackbotv2.mcpPublicUrl` | Remote MCP |
+| `apiRs.etl.slack.*` (+ `indexPrivateChannels`) | Slack ETL |
+| `apiRs.etl.linear` / `googleDrive` / `googleCalendar` | Other ETLs |
+| `apiRs.etl.companyContextDocuments` | Document projection |
+| `apiRs.workflowEnableMode` / `workflowAllowedNames` | Workflow policy |
+| `apiRs.sandboxWarmPoolSize` / `sandboxRunningLimit` / reaper knobs | Capacity |
+| `apiRs.syncInfraSecrets` | Startup infra role sync |
+| `sandbox.harnessEngine` + `*AuthMode` | Default harness / auth |
+| `overlays.sources[]` | Org tools/workflows/skills |
+| `repoCache.*` / `toolServer.*` | Repo-cache + tool delivery |
+| `slackbotv2.externalOrgAllowlist` | Slack Connect / external orgs |
+| `linearbot` / `githubbot` / `discordbot` / `teamsbot.enabled` | Extra ingresses |
+| `ironProxy.secretSource` / `upstreamDenyCidrs` | Credential plane |
+| `networkPolicy.otlpEgress` / observability egress | Obs networking |
+| `quick.enabled` / `litellm.enabled` | Static hosting / model gateway |
+| `agentSandbox.enabled` | Required for default agent-k8s path |
+
+---
+
+## 17. Directory map (repo)
+
+| Path | Owns |
+|------|------|
+| `services/api-rs/` | Rust control plane, sessions, sandboxes, MCP, workflows, Slack proxies |
+| `services/console/` | Credential UI/API, OAuth, Integrations, PWA, MCP AS |
+| `services/iron-proxy/` | Credential-injecting egress proxy |
+| `services/sandbox/` | Agent image, entrypoint, system prompt |
+| `crates/harness-server/` | Codex / Claude / Amp adapters |
+| `services/slackbotv2/` | Slack ingress |
+| `services/discordbot/`, `githubbot/`, `linearbot/`, `teamsbot/` | Other ingresses |
+| `services/workflow-python/` | Python workflow host |
+| `tools/` | Tool plugins |
+| `workflows/` | Workflow definitions |
+| `.agents/skills/` | Base skills |
+| `contrib/chart/` | Helm chart and values |
+| `packages/` | Shared TS contracts for ingresses |
+| `docs/pages/` | Documentation source (this file lives here) |
+
+---
+
+## 18. Guidance for coding agents
+
+When implementing or reviewing Centaur work:
+
+1. **Read the nearest `AGENTS.md`** before editing a service tree.
+2. **Prefer existing names** — tools, principals, chart keys, workflows —
+   over inventing parallel abstractions.
+3. **Keep clients thin** — durable state and lifecycle belong in api-rs.
+4. **Never materialize real credentials** in sandboxes, fixtures, logs, or
+   commits; use placeholders and Console grants.
+5. **If a contract changes**, update every producer, consumer, test fixture,
+   and chart value.
+6. **Do not market Apps PaaS or a Guest role as shipped.**
+7. **Validate** with the narrowest relevant tests, then cross-service proof
+   for boundary changes (`just deploy` + a real request path when publishing).
+8. **Local ≠ production authorization** — presence of a tool package does not
+   mean a principal can use it.
+
+### High-leverage features to consider enabling
+
+1. Console + `publicUrl` + SSO
+2. OAuth Apps → Integrations (Google / Slack / GitHub / Granola / Linear / Attio)
+3. MCP public URL + `user-mcp` tool grants
+4. Channel principals + Slack channel/DM permissions + `sandbox_api_server`
+5. Slack / Granola / Attio / Linear / GSuite ETL → `company_context`
+6. `externalOrgAllowlist` for Slack Connect
+7. Sandbox Settings defaults for new principals
+8. Overlays for org tools, workflows, skills, and system prompt
+
+---
+
+## 19. Change log note for readers
+
+This inventory was checked against fork commit `41f19669` on 2026-09-04,
+including: Console Integrations & PWA, remote MCP with `user-mcp`, Slack
+channel/DM permissions and API proxies, Attio/Granola OAuth + sync, sandbox
+defaults in Console Settings, MPP service discovery, and private Slack channel
+ETL flags.
+
+When in doubt, diff `contrib/chart/values.yaml` and recent commits on
+`paradigmxyz/centaur` rather than trusting a stale copy of this file.

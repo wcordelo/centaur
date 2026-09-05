@@ -48,8 +48,10 @@ outcomes where applicable.
 All TypeScript services belong to the root pnpm workspace. Install dependencies
 once from the repository root with `pnpm install --frozen-lockfile`; their
 scripts invoke Bun for runtime, tests, and type checking. Do not create nested
-lockfiles. If Chat SDK behavior is unclear, inspect `~/github/vercel/chat` and
-the repository's registered patches, not `node_modules`.
+lockfiles. If Chat SDK behavior is unclear, inspect `~/github/vercel/chat` when
+that optional checkout exists, then use the repository's registered patches,
+implementation, tests, and package documentation. Report a missing external
+checkout as a limitation; do not block unrelated work on it.
 
 ## Validation
 
